@@ -52,28 +52,28 @@ run_filter() {
 # ============================================================
 echo "=== 1. Bash tool use ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"npm test"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"success","input":{"command":"npm test"}}}}')
 assert_eq "bash tool" "agent[1] Shell: npm test" "$OUT"
 
 # ============================================================
 echo ""
 echo "=== 2. Read tool use ==="
 
-OUT=$(run_filter 2 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/main.ts"}}]}}')
+OUT=$(run_filter 2 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"read","state":{"status":"success","input":{"filePath":"src/main.ts"}}}}')
 assert_eq "read tool" "agent[2] Read src/main.ts" "$OUT"
 
 # ============================================================
 echo ""
 echo "=== 3. Write tool use ==="
 
-OUT=$(run_filter 3 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Write","input":{"file_path":"out/result.json"}}]}}')
+OUT=$(run_filter 3 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"write","state":{"status":"success","input":{"filePath":"out/result.json"}}}}')
 assert_eq "write tool" "agent[3] Write out/result.json" "$OUT"
 
 # ============================================================
 echo ""
 echo "=== 4. Edit tool use ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"lib/utils.py"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"edit","state":{"status":"success","input":{"filePath":"lib/utils.py"}}}}')
 assert_eq "edit tool" "agent[1] Edit lib/utils.py" "$OUT"
 
 # ============================================================
@@ -81,7 +81,7 @@ echo ""
 echo "=== 5. Long command truncation ==="
 
 LONG_CMD="echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa very long"
-OUT=$(run_filter 1 "{\"type\":\"assistant\",\"session_id\":\"s\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{\"command\":\"$LONG_CMD\"}}]}}")
+OUT=$(run_filter 1 "{\"type\":\"tool_use\",\"timestamp\":1,\"part\":{\"type\":\"tool\",\"callID\":\"c1\",\"tool\":\"bash\",\"state\":{\"status\":\"success\",\"input\":{\"command\":\"$LONG_CMD\"}}}}")
 assert_contains "truncated" "..." "$OUT"
 # After strip_ts: agent[1] Shell: (16) + 80 chars = 96.
 LINE_LEN=${#OUT}
@@ -97,31 +97,38 @@ fi
 echo ""
 echo "=== 6. Multi-line command uses first line ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"echo hello\necho world"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"success","input":{"command":"echo hello\necho world"}}}}')
 assert_eq "first line only" "agent[1] Shell: echo hello" "$OUT"
 
 # ============================================================
 echo ""
 echo "=== 7. Non-tool events are silent ==="
 
-OUT=$(run_filter 1 '{"type":"system","subtype":"init","session_id":"s","tools":["Bash"]}')
-assert_eq "system event silent" "" "$OUT"
+OUT=$(run_filter 1 '{"type":"step_start","timestamp":1,"sessionID":"s","part":{"type":"step-start"}}')
+assert_eq "step_start silent" "" "$OUT"
 
-OUT=$(run_filter 1 '{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.01}')
-assert_eq "result event silent" "" "$OUT"
+OUT=$(run_filter 1 '{"type":"step_finish","timestamp":1,"part":{"type":"step-finish","reason":"stop","cost":0.01,"tokens":{"total":100}}}')
+assert_eq "step_finish silent" "" "$OUT"
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"text","text":"Thinking..."}]}}')
+OUT=$(run_filter 1 '{"type":"text","timestamp":1,"part":{"type":"text","text":"Thinking..."}}')
 assert_eq "text event silent" "" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 8. Multiple tool uses in one message ==="
+echo "=== 8. Multiple tool events in stream ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"a.ts"}},{"type":"tool_use","id":"t2","name":"Read","input":{"file_path":"b.ts"}}]}}')
+cat > "$TMPDIR/stream.jsonl" <<'EOF'
+{"type":"step_start","timestamp":1,"sessionID":"s","part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":2,"part":{"type":"tool","callID":"c1","tool":"read","state":{"status":"success","input":{"filePath":"README.md"}}}}
+{"type":"tool_use","timestamp":3,"part":{"type":"tool","callID":"c2","tool":"bash","state":{"status":"success","input":{"command":"make build"}}}}
+{"type":"step_finish","timestamp":4,"part":{"type":"step-finish","reason":"stop","cost":0.05,"tokens":{"total":100,"input":50,"output":50}}}
+EOF
+
+OUT=$(AGENT_ID=5 "$FILTER" < "$TMPDIR/stream.jsonl" | strip_ts)
 LINES=$(echo "$OUT" | wc -l | tr -d ' ')
-assert_eq "two lines" "2" "$LINES"
-assert_contains "first file" "Read a.ts" "$OUT"
-assert_contains "second file" "Read b.ts" "$OUT"
+assert_eq "two activity lines" "2" "$LINES"
+assert_contains "read event" "agent[5] Read README.md" "$OUT"
+assert_contains "shell event" "agent[5] Shell: make build" "$OUT"
 
 # ============================================================
 echo ""
@@ -135,59 +142,41 @@ assert_eq "partial json skipped" "" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 10. Multi-line JSONL stream ==="
+echo "=== 10. Glob and Grep tools ==="
 
-cat > "$TMPDIR/stream.jsonl" <<'EOF'
-{"type":"system","subtype":"init","session_id":"s","tools":["Bash","Read"]}
-{"type":"assistant","session_id":"s","message":{"id":"m1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"README.md"}}]}}
-{"type":"user","session_id":"s","message":{"id":"m2","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"# Hello"}]}}
-{"type":"assistant","session_id":"s","message":{"id":"m3","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"make build"}}]}}
-{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.05}
-EOF
-
-OUT=$(AGENT_ID=5 "$FILTER" < "$TMPDIR/stream.jsonl" | strip_ts)
-LINES=$(echo "$OUT" | wc -l | tr -d ' ')
-assert_eq "two activity lines" "2" "$LINES"
-assert_contains "read event" "agent[5] Read README.md" "$OUT"
-assert_contains "shell event" "agent[5] Shell: make build" "$OUT"
-
-# ============================================================
-echo ""
-echo "=== 11. Glob and Grep tools ==="
-
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Glob","input":{"pattern":"**/*.ts"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"glob","state":{"status":"success","input":{"pattern":"**/*.ts"}}}}')
 assert_eq "glob tool" "agent[1] Glob **/*.ts" "$OUT"
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Grep","input":{"pattern":"TODO"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"grep","state":{"status":"success","input":{"pattern":"TODO"}}}}')
 assert_eq "grep tool" "agent[1] Grep TODO" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 12. Task tool ==="
+echo "=== 11. Task tool ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Task","input":{"description":"Fix lint errors"}}]}}')
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"task","state":{"status":"success","input":{"description":"Fix lint errors"}}}}')
 assert_eq "task tool" "agent[1] Task: Fix lint errors" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 13. Unknown tool ==="
+echo "=== 12. Unknown tool ==="
 
-OUT=$(run_filter 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"WebSearch","input":{"query":"test"}}]}}')
-assert_eq "unknown tool fallback" "agent[1] WebSearch" "$OUT"
+OUT=$(run_filter 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"websearch","state":{"status":"success","input":{"query":"test"}}}}')
+assert_eq "unknown tool fallback" "agent[1] websearch" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 14. Default AGENT_ID ==="
+echo "=== 13. Default AGENT_ID ==="
 
-OUT=$(AGENT_ID="" "$FILTER" <<< '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"pwd"}}]}}' | strip_ts)
+OUT=$(AGENT_ID="" "$FILTER" <<< '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"success","input":{"command":"pwd"}}}}' | strip_ts)
 assert_contains "empty id uses default" "agent[?] Shell: pwd" "$OUT"
 
 # ============================================================
 echo ""
-echo "=== 15. Timestamp prefix format ==="
+echo "=== 14. Timestamp prefix format ==="
 
-RAW=$(run_filter_raw 1 '{"type":"assistant","session_id":"s","message":{"id":"m","type":"message","role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"pwd"}}]}}')
-TS_MATCH=$(echo "$RAW" | grep -oP '^\d{2}:\d{2}:\d{2}' || true)
+RAW=$(run_filter_raw 1 '{"type":"tool_use","timestamp":1,"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"success","input":{"command":"pwd"}}}}')
+TS_MATCH=$(echo "$RAW" | grep -oE '^[0-9]{2}:[0-9]{2}:[0-9]{2}' || true)
 if [ -n "$TS_MATCH" ]; then
     echo "  PASS: has HH:MM:SS timestamp"
     PASS=$((PASS + 1))

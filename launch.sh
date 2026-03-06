@@ -41,6 +41,16 @@ rm_docker_dir() {
         || rm -rf "$dir" 2>/dev/null || true
 }
 
+# Auto-prefix bare model names with anthropic/ for backward compat.
+normalize_model() {
+    local m="$1"
+    if [[ "$m" != */* ]]; then
+        printf 'anthropic/%s' "$m"
+    else
+        printf '%s' "$m"
+    fi
+}
+
 CONFIG_FILE="${SWARM_CONFIG:-}"
 if [ -z "$CONFIG_FILE" ] && [ -f "$REPO_ROOT/swarm.json" ]; then
     CONFIG_FILE="$REPO_ROOT/swarm.json"
@@ -64,7 +74,7 @@ if [ -n "$CONFIG_FILE" ]; then
     NUM_AGENTS=$(jq '[.agents[].count] | add' "$CONFIG_FILE")
 else
     NUM_AGENTS="${SWARM_NUM_AGENTS:-3}"
-    CLAUDE_MODEL="${SWARM_MODEL:-claude-opus-4-6}"
+    OPENCODE_MODEL="$(normalize_model "${SWARM_MODEL:-claude-opus-4-6}")"
     SWARM_PROMPT="${SWARM_PROMPT:-}"
     SWARM_SETUP="${SWARM_SETUP:-}"
     MAX_IDLE="${SWARM_MAX_IDLE:-3}"
@@ -74,9 +84,14 @@ else
     EFFORT_LEVEL="${SWARM_EFFORT:-}"
 fi
 
+# Resolve the host auth.json path for opencode.
+OPENCODE_AUTH_JSON="${HOME}/.local/share/opencode/auth.json"
+
 cmd_start() {
-    if [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "$CONFIG_FILE" ]; then
-        echo "ERROR: ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN must be set." >&2
+    # Auth: need auth.json OR a config file (which may have per-agent keys).
+    if [ ! -f "$OPENCODE_AUTH_JSON" ] && [ -z "$CONFIG_FILE" ]; then
+        echo "ERROR: ${OPENCODE_AUTH_JSON} not found." >&2
+        echo "       Run 'opencode auth' to create it, or use a config file." >&2
         exit 1
     fi
 
@@ -163,7 +178,7 @@ cmd_start() {
     else
         : > "$AGENTS_CFG"
         for _i in $(seq 1 "$NUM_AGENTS"); do
-            printf '%s|||%s|||\n' "$CLAUDE_MODEL" "${EFFORT_LEVEL:-}" >> "$AGENTS_CFG"
+            printf '%s|||%s|||\n' "$OPENCODE_MODEL" "${EFFORT_LEVEL:-}" >> "$AGENTS_CFG"
         done
     fi
 
@@ -174,6 +189,12 @@ cmd_start() {
         MIRROR_ARGS+=($line)
     done < "/tmp/${PROJECT}-mirror-vols.txt"
 
+    # Auth volume mount for opencode.
+    AUTH_ARGS=()
+    if [ -f "$OPENCODE_AUTH_JSON" ]; then
+        AUTH_ARGS+=(-v "${OPENCODE_AUTH_JSON}:/home/agent/.local/share/opencode/auth.json:ro")
+    fi
+
     AGENT_IDX=0
     while IFS='|' read -r agent_model agent_base_url agent_api_key agent_effort agent_auth agent_context agent_prompt; do
         AGENT_IDX=$((AGENT_IDX + 1))
@@ -181,55 +202,40 @@ cmd_start() {
         docker rm -f "$NAME" 2>/dev/null || true
         agent_api_key="$(expand_env_ref "$agent_api_key")"
         agent_context="${agent_context:-full}"
+        agent_model="$(normalize_model "$agent_model")"
         local effective_prompt="${agent_prompt:-$SWARM_PROMPT}"
 
         local ctx_label="" prompt_label=""
         [ "$agent_context" != "full" ] && ctx_label=" context=${agent_context}"
         [ -n "$agent_prompt" ] && prompt_label=" prompt=${agent_prompt}"
-        echo "--- Launching ${NAME} (${agent_model}${agent_effort:+ effort=${agent_effort}}${agent_auth:+ auth=${agent_auth}}${ctx_label}${prompt_label}) ---"
+        echo "--- Launching ${NAME} (${agent_model}${agent_effort:+ effort=${agent_effort}}${ctx_label}${prompt_label}) ---"
         EXTRA_ENV=()
-        if [ -n "$agent_base_url" ]; then
-            EXTRA_ENV+=(-e "ANTHROPIC_BASE_URL=${agent_base_url}")
-        elif [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
-            EXTRA_ENV+=(-e "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}")
-        fi
-        [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] \
-            && EXTRA_ENV+=(-e "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}")
-
-        # Auto-tag agents with a custom api_key as "apikey" for the dashboard.
-        if [ -z "$agent_auth" ] && [ -n "$agent_api_key" ]; then
-            agent_auth="apikey"
-        fi
-
-        # Per-agent auth source: "oauth" = subscription only,
-        # "apikey" = API key only, "" = pass both (CLI decides).
-        local resolved_api_key
-        case "${agent_auth}" in
-            oauth)
-                resolved_api_key=""
-                EXTRA_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}")
-                ;;
-            apikey)
-                resolved_api_key="${agent_api_key:-${ANTHROPIC_API_KEY:-}}"
-                ;;
-            *)
-                resolved_api_key="${agent_api_key:-${ANTHROPIC_API_KEY:-}}"
-                [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-                    && EXTRA_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
-                ;;
-        esac
 
         local eff="${agent_effort:-${EFFORT_LEVEL:-}}"
         [ -n "$eff" ] \
-            && EXTRA_ENV+=(-e "CLAUDE_CODE_EFFORT_LEVEL=${eff}")
+            && EXTRA_ENV+=(-e "OPENCODE_EFFORT=${eff}")
+
+        # Per-agent api_key: generate an opencode.json config
+        # and mount it into the container.
+        local AGENT_CONFIG_ARGS=()
+        if [ -n "$agent_api_key" ]; then
+            local agent_config="/tmp/${PROJECT}-agent-${AGENT_IDX}-opencode.json"
+            local provider_section='"anthropic":{"options":{"apiKey":"'"${agent_api_key}"'"}}'
+            if [ -n "$agent_base_url" ]; then
+                provider_section='"anthropic":{"options":{"apiKey":"'"${agent_api_key}"'","baseURL":"'"${agent_base_url}"'"}}'
+            fi
+            printf '{"provider":{%s}}\n' "$provider_section" > "$agent_config"
+            AGENT_CONFIG_ARGS+=(-v "${agent_config}:/workspace/opencode.json:ro")
+        fi
 
         docker run -d \
             --name "$NAME" \
             -v "${BARE_REPO}:/upstream:rw" \
             "${MIRROR_ARGS[@]+"${MIRROR_ARGS[@]}"}" \
-            -e "ANTHROPIC_API_KEY=${resolved_api_key}" \
+            "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" \
+            "${AGENT_CONFIG_ARGS[@]+"${AGENT_CONFIG_ARGS[@]}"}" \
             "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}" \
-            -e "CLAUDE_MODEL=${agent_model}" \
+            -e "OPENCODE_MODEL=${agent_model}" \
             -e "SWARM_PROMPT=${effective_prompt}" \
             -e "SWARM_SETUP=${SWARM_SETUP}" \
             -e "MAX_IDLE=${MAX_IDLE}" \
@@ -264,7 +270,7 @@ cmd_start() {
             "$CONFIG_FILE")
         state_config_label=$(basename "$CONFIG_FILE")
     else
-        state_model_summary="${NUM_AGENTS}x ${CLAUDE_MODEL}"
+        state_model_summary="${NUM_AGENTS}x ${OPENCODE_MODEL}"
         state_config_label="env vars"
     fi
     cat > "/tmp/${PROJECT}-swarm.env" <<ENVEOF
@@ -360,6 +366,7 @@ cmd_post_process() {
     local pp_prompt pp_model pp_base_url pp_api_key pp_effort pp_auth
     pp_prompt=$(jq -r '.post_process.prompt // empty' "$CONFIG_FILE")
     pp_model=$(jq -r '.post_process.model // "claude-opus-4-6"' "$CONFIG_FILE")
+    pp_model="$(normalize_model "$pp_model")"
     pp_base_url=$(jq -r '.post_process.base_url // empty' "$CONFIG_FILE")
     pp_api_key=$(jq -r '.post_process.api_key // empty' "$CONFIG_FILE")
     pp_api_key="$(expand_env_ref "$pp_api_key")"
@@ -395,46 +402,37 @@ cmd_post_process() {
     done < "/tmp/${PROJECT}-pp-vols.txt"
     rm -f "/tmp/${PROJECT}-pp-vols.txt"
 
-    if [ -z "$pp_auth" ] && [ -n "$pp_api_key" ]; then
-        pp_auth="apikey"
+    # Auth volume mount for opencode.
+    local AUTH_ARGS=()
+    if [ -f "$OPENCODE_AUTH_JSON" ]; then
+        AUTH_ARGS+=(-v "${OPENCODE_AUTH_JSON}:/home/agent/.local/share/opencode/auth.json:ro")
     fi
 
     local EXTRA_ENV=()
-    if [ -n "$pp_base_url" ]; then
-        EXTRA_ENV+=(-e "ANTHROPIC_BASE_URL=${pp_base_url}")
-    elif [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
-        EXTRA_ENV+=(-e "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}")
-    fi
-    [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] \
-        && EXTRA_ENV+=(-e "ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN}")
-
-    local pp_resolved_api_key
-    case "${pp_auth}" in
-        oauth)
-            pp_resolved_api_key=""
-            EXTRA_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}")
-            ;;
-        apikey)
-            pp_resolved_api_key="${pp_api_key:-${ANTHROPIC_API_KEY:-}}"
-            ;;
-        *)
-            pp_resolved_api_key="${pp_api_key:-${ANTHROPIC_API_KEY:-}}"
-            [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-                && EXTRA_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}")
-            ;;
-    esac
-
     [ -n "$pp_effort" ] \
-        && EXTRA_ENV+=(-e "CLAUDE_CODE_EFFORT_LEVEL=${pp_effort}")
+        && EXTRA_ENV+=(-e "OPENCODE_EFFORT=${pp_effort}")
+
+    # Per-agent api_key config.
+    local PP_CONFIG_ARGS=()
+    if [ -n "$pp_api_key" ]; then
+        local pp_config="/tmp/${PROJECT}-pp-opencode.json"
+        local provider_section='"anthropic":{"options":{"apiKey":"'"${pp_api_key}"'"}}'
+        if [ -n "$pp_base_url" ]; then
+            provider_section='"anthropic":{"options":{"apiKey":"'"${pp_api_key}"'","baseURL":"'"${pp_base_url}"'"}}'
+        fi
+        printf '{"provider":{%s}}\n' "$provider_section" > "$pp_config"
+        PP_CONFIG_ARGS+=(-v "${pp_config}:/workspace/opencode.json:ro")
+    fi
 
     echo "--- Starting post-processing (${pp_model}) ---"
     docker run -d \
         --name "$NAME" \
         -v "${BARE_REPO}:/upstream:rw" \
         "${MIRROR_ARGS[@]+"${MIRROR_ARGS[@]}"}" \
-        -e "ANTHROPIC_API_KEY=${pp_resolved_api_key}" \
+        "${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}" \
+        "${PP_CONFIG_ARGS[@]+"${PP_CONFIG_ARGS[@]}"}" \
         "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}" \
-        -e "CLAUDE_MODEL=${pp_model}" \
+        -e "OPENCODE_MODEL=${pp_model}" \
         -e "SWARM_PROMPT=${pp_prompt}" \
         -e "SWARM_SETUP=${SWARM_SETUP:-}" \
         -e "MAX_IDLE=${MAX_IDLE}" \
@@ -473,7 +471,7 @@ cmd_help() {
     cat <<HELP
 Usage: $0 COMMAND [OPTIONS]
 
-Orchestrate Claude Code agents in Docker containers.
+Orchestrate OpenCode agents in Docker containers.
 
 Commands:
   start [--dashboard]  Build image, create bare repo, launch agents.
@@ -485,8 +483,6 @@ Commands:
   post-process         Run the post-processing agent from the config.
 
 Environment:
-  ANTHROPIC_API_KEY         API key (required unless OAuth token or config).
-  CLAUDE_CODE_OAUTH_TOKEN   OAuth token for subscription-based auth.
   SWARM_CONFIG              Path to swarm.json config file.
   SWARM_PROMPT              Prompt file path (env-var mode).
   SWARM_MODEL               Model name (default: claude-opus-4-6).
@@ -494,6 +490,10 @@ Environment:
   SWARM_MAX_IDLE            Idle sessions before exit (default: 3).
   SWARM_EFFORT              Reasoning effort: low, medium, high.
   SWARM_TITLE               Dashboard title override.
+
+Auth:
+  Mounts ~/.local/share/opencode/auth.json into containers.
+  Per-agent api_key in swarm.json generates per-container config.
 HELP
 }
 

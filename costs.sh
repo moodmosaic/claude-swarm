@@ -101,10 +101,12 @@ for cname in $containers; do
     state=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo "?")
     env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
         "$cname" 2>/dev/null || true)
-    model=$(printf '%s' "$env_dump" | grep '^CLAUDE_MODEL=' | head -1 | cut -d= -f2- || true)
+    model=$(printf '%s' "$env_dump" | grep '^OPENCODE_MODEL=' | head -1 | cut -d= -f2- || true)
     model="${model:-unknown}"
-    effort=$(printf '%s' "$env_dump" | grep '^CLAUDE_CODE_EFFORT_LEVEL=' | head -1 | cut -d= -f2- || true)
-    short="${model/claude-/}"
+    effort=$(printf '%s' "$env_dump" | grep '^OPENCODE_EFFORT=' | head -1 | cut -d= -f2- || true)
+    # Extract short model name from provider/model format.
+    short="${model##*/}"
+    short="${short#claude-}"
     if [ -n "$effort" ]; then
         eff_tag="${effort:0:1}"
         short="${short} [${eff_tag^^}]"

@@ -45,6 +45,16 @@ parse_pp_auth() { jq -r '.post_process.auth // empty' "$1"; }
 
 parse_pp_effort() { jq -r '.post_process.effort // empty' "$1"; }
 
+# Model name normalization (auto-prefix bare names).
+normalize_model() {
+    local m="$1"
+    if [[ "$m" != */* ]]; then
+        printf 'anthropic/%s' "$m"
+    else
+        printf '%s' "$m"
+    fi
+}
+
 # ============================================================
 echo "=== 1. Mixed-model config ==="
 
@@ -136,12 +146,12 @@ assert_eq "prompt is empty" "" "$(parse_prompt "$TMPDIR/noprompt.json")"
 echo ""
 echo "=== 4. Env-var fallback (synthetic TSV) ==="
 
-CLAUDE_MODEL="claude-opus-4-6"
+OPENCODE_MODEL="anthropic/claude-opus-4-6"
 EFFORT_LEVEL="medium"
 NUM_AGENTS=3
 : > "$TMPDIR/env-agents.cfg"
 for _i in $(seq 1 "$NUM_AGENTS"); do
-    printf '%s|||%s|||\n' "$CLAUDE_MODEL" "$EFFORT_LEVEL" >> "$TMPDIR/env-agents.cfg"
+    printf '%s|||%s|||\n' "$OPENCODE_MODEL" "$EFFORT_LEVEL" >> "$TMPDIR/env-agents.cfg"
 done
 
 assert_eq "line count" "3" "$(wc -l < "$TMPDIR/env-agents.cfg" | tr -d ' ')"
@@ -153,7 +163,7 @@ done < "$TMPDIR/env-agents.cfg"
 assert_eq "agents iterated" "3" "$AGENT_IDX"
 
 IFS='|' read -r m u k e a c p < "$TMPDIR/env-agents.cfg"
-assert_eq "env model"    "claude-opus-4-6" "$m"
+assert_eq "env model"    "anthropic/claude-opus-4-6" "$m"
 assert_eq "env base_url" ""               "$u"
 assert_eq "env api_key"  ""               "$k"
 assert_eq "env effort"   "medium"         "$e"
@@ -450,6 +460,15 @@ assert_eq "context with prompt" "none" "$c3"
 
 IFS='|' read -r m4 u4 k4 e4 a4 c4 p4 <<< "$LINE4"
 assert_eq "prompt same group" "tasks/explore.md" "$p4"
+
+# ============================================================
+echo ""
+echo "=== 18. Model name auto-prefix ==="
+
+assert_eq "bare name"        "anthropic/claude-opus-4-6"  "$(normalize_model "claude-opus-4-6")"
+assert_eq "already prefixed" "anthropic/claude-opus-4-6"  "$(normalize_model "anthropic/claude-opus-4-6")"
+assert_eq "openrouter"       "openrouter/custom"          "$(normalize_model "openrouter/custom")"
+assert_eq "other provider"   "google/gemini-pro"          "$(normalize_model "google/gemini-pro")"
 
 # ============================================================
 echo ""

@@ -27,9 +27,20 @@ assert_eq() {
 
 shorten_model() {
     local m="$1"
-    local short="${m/claude-/}"
-    short="${short//\//-}"
+    # Strip provider prefix.
+    local short="${m##*/}"
+    # Strip claude- prefix.
+    short="${short#claude-}"
     echo "$short"
+}
+
+normalize_model() {
+    local m="$1"
+    if [[ "$m" != */* ]]; then
+        printf 'anthropic/%s' "$m"
+    else
+        printf '%s' "$m"
+    fi
 }
 
 parse_inject_git_rules() { jq -r 'if has("inject_git_rules") then .inject_git_rules else true end' "$1"; }
@@ -45,72 +56,51 @@ parse_agents_cfg() {
         [.model, (.base_url // ""), (.api_key // ""), (.effort // ""), (.auth // ""), (.context // ""), (.prompt // "")] | join("|")' "$1"
 }
 
-# Mirrors the per-agent credential selection in launch.sh.
-resolve_agent_creds() {
-    local agent_auth="$1" agent_api_key="$2" global_api_key="$3" global_oauth="$4"
-    local resolved_key="" oauth_env=""
-    case "${agent_auth}" in
-        oauth)
-            resolved_key=""
-            oauth_env="CLAUDE_CODE_OAUTH_TOKEN=${global_oauth}"
-            ;;
-        apikey)
-            resolved_key="${agent_api_key:-${global_api_key}}"
-            oauth_env=""
-            ;;
-        *)
-            resolved_key="${agent_api_key:-${global_api_key}}"
-            [ -n "$global_oauth" ] && oauth_env="CLAUDE_CODE_OAUTH_TOKEN=${global_oauth}"
-            ;;
-    esac
-    echo "${resolved_key}|${oauth_env}"
-}
-
-# Mirrors the validation guard in cmd_start().
+# Mirrors the auth validation in launch.sh.
 check_auth() {
-    local api_key="$1" oauth_token="$2" config_file="$3"
-    if [ -z "$api_key" ] && [ -z "$oauth_token" ] && [ -z "$config_file" ]; then
+    local auth_json_exists="$1" config_file="$2"
+    if [ "$auth_json_exists" = "false" ] && [ -z "$config_file" ]; then
         echo "fail"
     else
         echo "pass"
     fi
 }
 
-# Mirrors the EXTRA_ENV construction for CLAUDE_CODE_OAUTH_TOKEN.
-build_oauth_extra_env() {
-    local token="$1"
-    local -a EXTRA_ENV=()
-    [ -n "$token" ] \
-        && EXTRA_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${token}")
-    echo "${EXTRA_ENV[*]+"${EXTRA_ENV[*]}"}"
-}
-
 # ============================================================
 echo "=== 1. Model name shortening ==="
 
-assert_eq "opus"        "opus-4-6"          "$(shorten_model "claude-opus-4-6")"
-assert_eq "sonnet"      "sonnet-4-5"        "$(shorten_model "claude-sonnet-4-5")"
-assert_eq "haiku"       "haiku-4-5"         "$(shorten_model "claude-haiku-4-5")"
-assert_eq "openrouter"  "openrouter-custom" "$(shorten_model "openrouter/custom")"
-assert_eq "no prefix"   "MiniMax-M2.5"      "$(shorten_model "MiniMax-M2.5")"
-assert_eq "double slash" "a-b-c"            "$(shorten_model "a/b/c")"
+assert_eq "opus"        "opus-4-6"    "$(shorten_model "anthropic/claude-opus-4-6")"
+assert_eq "sonnet"      "sonnet-4-5"  "$(shorten_model "anthropic/claude-sonnet-4-5")"
+assert_eq "haiku"       "haiku-4-5"   "$(shorten_model "anthropic/claude-haiku-4-5")"
+assert_eq "openrouter"  "custom"      "$(shorten_model "openrouter/custom")"
+assert_eq "no prefix"   "MiniMax-M2.5" "$(shorten_model "anthropic/MiniMax-M2.5")"
+assert_eq "bare model"  "opus-4-6"    "$(shorten_model "claude-opus-4-6")"
 
 # ============================================================
 echo ""
-echo "=== 2. TSV generation (env var path) ==="
+echo "=== 2. Model name normalization ==="
 
-CLAUDE_MODEL="claude-opus-4-6"
+assert_eq "bare name"        "anthropic/claude-opus-4-6"  "$(normalize_model "claude-opus-4-6")"
+assert_eq "already prefixed" "anthropic/claude-opus-4-6"  "$(normalize_model "anthropic/claude-opus-4-6")"
+assert_eq "openrouter"       "openrouter/custom"          "$(normalize_model "openrouter/custom")"
+assert_eq "other provider"   "google/gemini-pro"          "$(normalize_model "google/gemini-pro")"
+
+# ============================================================
+echo ""
+echo "=== 3. TSV generation (env var path) ==="
+
+OPENCODE_MODEL="anthropic/claude-opus-4-6"
 EFFORT_LEVEL="medium"
 NUM_AGENTS=3
 : > "$TMPDIR/env-agents.cfg"
 for _i in $(seq 1 "$NUM_AGENTS"); do
-    printf '%s|||%s|||\n' "$CLAUDE_MODEL" "$EFFORT_LEVEL" >> "$TMPDIR/env-agents.cfg"
+    printf '%s|||%s|||\n' "$OPENCODE_MODEL" "$EFFORT_LEVEL" >> "$TMPDIR/env-agents.cfg"
 done
 
 assert_eq "line count" "3" "$(wc -l < "$TMPDIR/env-agents.cfg" | tr -d ' ')"
 
 IFS='|' read -r m u k e a c p < "$TMPDIR/env-agents.cfg"
-assert_eq "model"    "claude-opus-4-6" "$m"
+assert_eq "model"    "anthropic/claude-opus-4-6" "$m"
 assert_eq "base_url" ""               "$u"
 assert_eq "api_key"  ""               "$k"
 assert_eq "effort"   "medium"         "$e"
@@ -119,7 +109,7 @@ assert_eq "context"  ""               "$c"
 
 # ============================================================
 echo ""
-echo "=== 3. inject_git_rules config ==="
+echo "=== 4. inject_git_rules config ==="
 
 cat > "$TMPDIR/default.json" <<'EOF'
 { "prompt": "p.md", "agents": [{ "count": 1, "model": "m" }] }
@@ -139,7 +129,7 @@ assert_eq "explicit true"     "true"  "$(parse_inject_git_rules "$TMPDIR/inject_
 
 # ============================================================
 echo ""
-echo "=== 4. Post-process config parsing ==="
+echo "=== 5. Post-process config parsing ==="
 
 cat > "$TMPDIR/pp_full.json" <<'EOF'
 {
@@ -179,7 +169,7 @@ assert_eq "no pp prompt" "" "$(parse_pp_prompt "$TMPDIR/no_pp.json")"
 
 # ============================================================
 echo ""
-echo "=== 5. Git user name is clean (no model tag) ==="
+echo "=== 6. Git user name is clean (no model tag) ==="
 
 GIT_USER_NAME="swarm-agent"
 assert_eq "default name clean" "swarm-agent" "$GIT_USER_NAME"
@@ -189,7 +179,7 @@ assert_eq "custom name clean" "Nikos Baxevanis" "$GIT_USER_NAME"
 
 # ============================================================
 echo ""
-echo "=== 6. Effort in agent TSV (config path) ==="
+echo "=== 7. Effort in agent TSV (config path) ==="
 
 cat > "$TMPDIR/effort.json" <<'EOF'
 {
@@ -218,7 +208,7 @@ assert_eq "haiku effort (empty)" "" "$e4"
 
 # ============================================================
 echo ""
-echo "=== 7. Effort in post-process ==="
+echo "=== 8. Effort in post-process ==="
 
 cat > "$TMPDIR/pp_effort.json" <<'EOF'
 {
@@ -237,34 +227,23 @@ assert_eq "pp effort absent" ""   "$(parse_pp_effort "$TMPDIR/no_pp.json")"
 
 # ============================================================
 echo ""
-echo "=== 8. Effort env var fallback (no effort set) ==="
+echo "=== 9. Effort env var fallback (no effort set) ==="
 
 EFFORT_LEVEL=""
 : > "$TMPDIR/env-no-effort.cfg"
-printf '%s|||%s|||\n' "claude-opus-4-6" "$EFFORT_LEVEL" >> "$TMPDIR/env-no-effort.cfg"
+printf '%s|||%s|||\n' "anthropic/claude-opus-4-6" "$EFFORT_LEVEL" >> "$TMPDIR/env-no-effort.cfg"
 
 IFS='|' read -r m u k e a c p < "$TMPDIR/env-no-effort.cfg"
 assert_eq "no effort" "" "$e"
 
 # ============================================================
 echo ""
-echo "=== 9. OAuth auth validation ==="
+echo "=== 10. Auth validation ==="
 
-assert_eq "api_key only"        "pass" "$(check_auth "sk-key" "" "")"
-assert_eq "oauth only"          "pass" "$(check_auth "" "sk-ant-oat01-tok" "")"
-assert_eq "both set"            "pass" "$(check_auth "sk-key" "sk-ant-oat01-tok" "")"
-assert_eq "config only"         "pass" "$(check_auth "" "" "swarm.json")"
-assert_eq "nothing set"         "fail" "$(check_auth "" "" "")"
-assert_eq "oauth + config"      "pass" "$(check_auth "" "sk-ant-oat01-tok" "swarm.json")"
-
-# ============================================================
-echo ""
-echo "=== 10. OAuth EXTRA_ENV construction ==="
-
-assert_eq "oauth env set" \
-    "-e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-test" \
-    "$(build_oauth_extra_env "sk-ant-oat01-test")"
-assert_eq "oauth env empty" "" "$(build_oauth_extra_env "")"
+assert_eq "auth.json exists"    "pass" "$(check_auth "true" "")"
+assert_eq "config only"         "pass" "$(check_auth "false" "swarm.json")"
+assert_eq "both"                "pass" "$(check_auth "true" "swarm.json")"
+assert_eq "nothing set"         "fail" "$(check_auth "false" "")"
 
 # ============================================================
 echo ""
@@ -299,35 +278,7 @@ assert_eq "auth custom key" "sk-mm" "$k3"
 
 # ============================================================
 echo ""
-echo "=== 12. Per-agent credential resolution ==="
-
-RESULT=$(resolve_agent_creds "oauth" "" "sk-global" "sk-oat-tok")
-IFS='|' read -r rk re <<< "$RESULT"
-assert_eq "oauth: api_key cleared"  ""  "$rk"
-assert_eq "oauth: token passed" "CLAUDE_CODE_OAUTH_TOKEN=sk-oat-tok" "$re"
-
-RESULT=$(resolve_agent_creds "apikey" "" "sk-global" "sk-oat-tok")
-IFS='|' read -r rk re <<< "$RESULT"
-assert_eq "apikey: api_key set"   "sk-global" "$rk"
-assert_eq "apikey: no token"      ""           "$re"
-
-RESULT=$(resolve_agent_creds "" "" "sk-global" "sk-oat-tok")
-IFS='|' read -r rk re <<< "$RESULT"
-assert_eq "default: api_key set"  "sk-global" "$rk"
-assert_eq "default: token passed" "CLAUDE_CODE_OAUTH_TOKEN=sk-oat-tok" "$re"
-
-RESULT=$(resolve_agent_creds "" "sk-agent" "sk-global" "sk-oat-tok")
-IFS='|' read -r rk re <<< "$RESULT"
-assert_eq "custom key overrides"  "sk-agent" "$rk"
-
-RESULT=$(resolve_agent_creds "" "" "sk-global" "")
-IFS='|' read -r rk re <<< "$RESULT"
-assert_eq "no oauth: api_key set" "sk-global" "$rk"
-assert_eq "no oauth: no token"    ""           "$re"
-
-# ============================================================
-echo ""
-echo "=== 13. Context field in agent TSV ==="
+echo "=== 12. Context field in agent TSV ==="
 
 cat > "$TMPDIR/context.json" <<'EOF'
 {
@@ -356,7 +307,7 @@ assert_eq "context slim" "slim" "$c3"
 
 # ============================================================
 echo ""
-echo "=== 14. Prompt field in agent TSV ==="
+echo "=== 13. Prompt field in agent TSV ==="
 
 cat > "$TMPDIR/per_prompt.json" <<'EOF'
 {

@@ -10,7 +10,7 @@ set -euo pipefail
 #   --unit          Run unit tests only (no Docker or API key needed).
 #   --all           Run unit tests then full integration matrix.
 #   --oauth         Integration test using OAuth token (needs Docker +
-#                   CLAUDE_CODE_OAUTH_TOKEN).
+#                   auth.json).
 #   --config FILE   Use a swarm.json for mixed-model testing.
 #   --no-inject     Disable git rule injection; prompt includes
 #                   explicit git commands (backward compat test).
@@ -52,11 +52,12 @@ run_all_tests() {
     cmd_unit || unit_fail=1
     echo ""
 
-    # Phase 2: integration tests (require ANTHROPIC_API_KEY).
+    # Phase 2: integration tests (require auth.json or ANTHROPIC_API_KEY).
     echo "=== Phase 2: Integration tests ==="
     echo ""
-    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-        echo "  SKIP  (ANTHROPIC_API_KEY not set)"
+    OPENCODE_AUTH_JSON="${HOME}/.local/share/opencode/auth.json"
+    if [ ! -f "$OPENCODE_AUTH_JSON" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "  SKIP  (no auth.json and ANTHROPIC_API_KEY not set)"
         echo ""
     else
         local cases=(
@@ -64,7 +65,7 @@ run_all_tests() {
             "2-agents-env|2||"
             "3-agents-env|3||"
             "2-agents-no-inject|2||--no-inject"
-            "2-agents-sonnet|2|claude-sonnet-4-6|"
+            "2-agents-sonnet|2|anthropic/claude-sonnet-4-6|"
             "2-agents-config|2|config-single|"
             "3-agents-mixed|3|config-mixed|"
             "1-agent-effort-env|1|effort-env|"
@@ -96,46 +97,11 @@ run_all_tests() {
         echo ""
     fi
 
-    # Phase 3: OAuth integration tests (require CLAUDE_CODE_OAUTH_TOKEN).
-    local oauth_pass=0 oauth_fail=0
-    echo "=== Phase 3: OAuth integration tests ==="
+    # Phase 3: additional integration tests (placeholder).
+    echo "=== Phase 3: Additional integration tests ==="
     echo ""
-    if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-        echo "  SKIP  (CLAUDE_CODE_OAUTH_TOKEN not set)"
-        echo ""
-    else
-        local oauth_cases=(
-            "1-agent-oauth|1|oauth-only|"
-        )
-        # Mixed-auth requires both API key and OAuth token.
-        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-            oauth_cases+=("2-agents-mixed-auth|2|config-mixed-auth|")
-        fi
-
-        for entry in "${oauth_cases[@]}"; do
-            IFS='|' read -r label num_agents model_or_cfg extra_flag <<< "$entry"
-            local t_start t_elapsed
-            t_start=$(date +%s)
-
-            local rc=0
-            if [ "$model_or_cfg" = "oauth-only" ]; then
-                cmd_oauth || rc=$?
-            else
-                run_integration_case "$label" "$num_agents" \
-                    "$model_or_cfg" "$extra_flag" || rc=$?
-            fi
-
-            t_elapsed=$(( $(date +%s) - t_start ))
-            if [ "$rc" -eq 0 ]; then
-                printf "  PASS  %-24s (%ds)\n" "$label" "$t_elapsed"
-                oauth_pass=$((oauth_pass + 1))
-            else
-                printf "  FAIL  %-24s (%ds)\n" "$label" "$t_elapsed"
-                oauth_fail=$((oauth_fail + 1))
-            fi
-        done
-        echo ""
-    fi
+    echo "  SKIP  (OAuth tests removed -- auth via auth.json)"
+    echo ""
 
     # Summary.
     local total_elapsed
@@ -149,22 +115,16 @@ run_all_tests() {
     else
         echo "  Unit:        FAIL"
     fi
-    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    if [ -f "$OPENCODE_AUTH_JSON" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
         printf "  Integration: %d/%d passed\n" \
             "$int_pass" $((int_pass + int_fail))
     else
-        echo "  Integration: SKIP (ANTHROPIC_API_KEY not set)"
-    fi
-    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-        printf "  OAuth:       %d/%d passed\n" \
-            "$oauth_pass" $((oauth_pass + oauth_fail))
-    else
-        echo "  OAuth:       SKIP (CLAUDE_CODE_OAUTH_TOKEN not set)"
+        echo "  Integration: SKIP (no auth.json)"
     fi
     printf "  Total time:  %dm %02ds\n" "$total_m" "$total_s"
     echo "============================================================"
 
-    [ "$unit_fail" -eq 0 ] && [ "$int_fail" -eq 0 ] && [ "$oauth_fail" -eq 0 ]
+    [ "$unit_fail" -eq 0 ] && [ "$int_fail" -eq 0 ]
 }
 
 run_integration_case() {
@@ -176,7 +136,7 @@ run_integration_case() {
         config-single)
             local cfg
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
+            jq -n --arg m "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
                 '{prompt: "unused", agents: [{count: '"$num_agents"', model: $m}]}' \
                 > "$cfg"
             args+=(--config "$cfg")
@@ -184,8 +144,8 @@ run_integration_case() {
         config-mixed)
             local cfg
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m1 "${SWARM_MODEL:-claude-opus-4-6}" \
-                  --arg m2 "claude-sonnet-4-6" \
+            jq -n --arg m1 "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
+                  --arg m2 "anthropic/claude-sonnet-4-6" \
                 '{prompt: "unused", agents: [
                     {count: 2, model: $m1},
                     {count: 1, model: $m2}
@@ -202,7 +162,7 @@ test-results/summary.txt with the word DONE on the last line.
 Commit and push.
 PPPROMPT
             cp "$pp_prompt" "$REPO_ROOT/.claude-swarm-pp-prompt.md"
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
+            jq -n --arg m "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
                   --arg pp ".claude-swarm-pp-prompt.md" \
                 '{prompt: "unused",
                   agents: [{count: '"$num_agents"', model: $m}],
@@ -218,28 +178,18 @@ PPPROMPT
         config-effort)
             local cfg
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m1 "${SWARM_MODEL:-claude-opus-4-6}" \
-                  --arg m2 "claude-sonnet-4-6" \
+            jq -n --arg m1 "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
+                  --arg m2 "anthropic/claude-sonnet-4-6" \
                 '{prompt: "unused", agents: [
                     {count: 1, model: $m1, effort: "high"},
                     {count: 1, model: $m2, effort: "low"}
                 ]}' > "$cfg"
             args+=(--config "$cfg")
             ;;
-        config-mixed-auth)
-            local cfg
-            cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
-                '{prompt: "unused", agents: [
-                    {count: 1, model: $m, auth: "apikey"},
-                    {count: 1, model: $m, auth: "oauth"}
-                ]}' > "$cfg"
-            args+=(--config "$cfg")
-            ;;
         config-context-none)
             local cfg
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
+            jq -n --arg m "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
                 '{prompt: "unused", agents: [
                     {count: 1, model: $m},
                     {count: 1, model: $m, context: "none"}
@@ -249,7 +199,7 @@ PPPROMPT
         config-context-slim)
             local cfg
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
+            jq -n --arg m "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
                 '{prompt: "unused", agents: [
                     {count: 1, model: $m},
                     {count: 1, model: $m, context: "slim"}
@@ -260,7 +210,7 @@ PPPROMPT
             local cfg alt_prompt
             cfg=$(mktemp "/tmp/${PROJECT}-inttest.XXXXXX.json")
             alt_prompt=".claude-swarm-smoke-alt.md"
-            jq -n --arg m "${SWARM_MODEL:-claude-opus-4-6}" \
+            jq -n --arg m "${SWARM_MODEL:-anthropic/claude-opus-4-6}" \
                 --arg ap "$alt_prompt" \
                 '{prompt: "unused", agents: [
                     {count: 1, model: $m},
@@ -284,7 +234,6 @@ PPPROMPT
 
     local rc=0
     env "${env_prefix[@]+"${env_prefix[@]}"}" \
-        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}" \
         SWARM_TITLE="$label" \
         TIMEOUT="${TIMEOUT}" \
         "$TESTS_DIR/test.sh" "${args[@]+"${args[@]}"}" || rc=$?
@@ -321,43 +270,31 @@ cmd_unit() {
 }
 
 cmd_oauth() {
-    if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-        echo "ERROR: CLAUDE_CODE_OAUTH_TOKEN is not set." >&2
-        echo "       Generate one with: claude setup-token" >&2
-        exit 1
-    fi
-
-    local rc=0
-    env ANTHROPIC_API_KEY="" \
-        CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN}" \
-        SWARM_NUM_AGENTS="1" \
-        SWARM_TITLE="1-agent-oauth" \
-        TIMEOUT="${TIMEOUT}" \
-        "$TESTS_DIR/test.sh" || rc=$?
-    return "$rc"
+    echo "OAuth test skipped -- auth via auth.json." >&2
+    return 0
 }
 
 cmd_help() {
     cat <<'HELP'
 Usage: ./test.sh [OPTIONS]
 
-Run claude-swarm tests.
+Run swarm tests.
 
 Options:
-  (no args)         Single integration smoke test (needs Docker + API key).
+  (no args)         Single integration smoke test (needs Docker + auth).
   --unit            Unit tests only (no Docker or API key needed).
   --all             Unit tests, then full integration matrix.
-  --oauth           Integration test using CLAUDE_CODE_OAUTH_TOKEN
-                    (needs Docker + OAuth token).
+  --oauth           (deprecated, no-op).
   --config FILE     Use a swarm.json for mixed-model testing.
   --no-inject       Explicit git commands in prompt (backward compat test).
   -h, --help        Show this help message.
 
 Environment:
-  ANTHROPIC_API_KEY        Required for integration tests.
-  CLAUDE_CODE_OAUTH_TOKEN  Required for --oauth tests.
   TIMEOUT                  Seconds to wait for agents (default: 600).
   SWARM_MODEL              Model for env-var integration cases.
+
+Auth:
+  Uses ~/.local/share/opencode/auth.json (mounted into containers).
 HELP
 }
 
@@ -570,8 +507,6 @@ cleanup() {
     else
         SWARM_PROMPT="$PROMPT_FILE" \
             SWARM_SETUP="$SETUP_FILE" \
-            ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-            CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}" \
             SWARM_NUM_AGENTS="${NUM_AGENTS}" \
             "$SWARM_DIR/launch.sh" stop 2>/dev/null || true
     fi
@@ -595,14 +530,10 @@ echo ""
 
 if [ -n "$TEMP_CONFIG" ]; then
     SWARM_CONFIG="$TEMP_CONFIG" \
-        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-        CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}" \
         "$SWARM_DIR/launch.sh" start
 else
     SWARM_PROMPT="$PROMPT_FILE" \
         SWARM_SETUP="$SETUP_FILE" \
-        ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-        CLAUDE_CODE_OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}" \
         SWARM_NUM_AGENTS="${NUM_AGENTS}" \
         SWARM_INJECT_GIT_RULES="${INJECT_ENV}" \
         "$SWARM_DIR/launch.sh" start

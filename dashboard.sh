@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Always-on TUI dashboard for claude-swarm.
+# Always-on TUI dashboard for swarm.
 # Pure bash with ANSI escape codes and tput.
 
 SWARM_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,7 +15,7 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     cat <<HELP
 Usage: $0
 
-Always-on TUI dashboard for claude-swarm.
+Always-on TUI dashboard for swarm.
 Refreshes every 2 seconds. Shows per-agent model, auth source,
 status, cost, token usage, cache hits, turns, and duration.
 
@@ -44,7 +44,7 @@ if [ -f "$STATE_FILE" ]; then
     source "$STATE_FILE"
 fi
 
-DASHBOARD_TITLE="${USER_TITLE:-${SWARM_TITLE:-claude-swarm}}"
+DASHBOARD_TITLE="${USER_TITLE:-${SWARM_TITLE:-swarm}}"
 
 CONFIG_FILE="${SWARM_CONFIG:-}"
 if [ -z "$CONFIG_FILE" ] && [ -f "$REPO_ROOT/swarm.json" ]; then
@@ -81,8 +81,8 @@ else
         [ "$NUM_AGENTS" -eq 0 ] && NUM_AGENTS=3
     fi
     SWARM_PROMPT="${SWARM_PROMPT:-}"
-    CLAUDE_MODEL="${SWARM_MODEL:-claude-opus-4-6}"
-    MODEL_SUMMARY="${NUM_AGENTS}x ${CLAUDE_MODEL}"
+    OPENCODE_MODEL="${SWARM_MODEL:-anthropic/claude-opus-4-6}"
+    MODEL_SUMMARY="${NUM_AGENTS}x ${OPENCODE_MODEL}"
     CONFIG_LABEL="env vars"
 fi
 
@@ -175,12 +175,22 @@ read_agent_stats() {
     rm -f "$tmpf"
 }
 
+# Extract short model name from provider/model format.
+shorten_model() {
+    local m="$1"
+    # Strip provider prefix (e.g. anthropic/claude-opus-4-6 -> claude-opus-4-6).
+    local short="${m##*/}"
+    # Strip claude- prefix for brevity.
+    short="${short#claude-}"
+    echo "$short"
+}
+
 draw() {
     # Re-read state file so display updates between test cases.
     if [ -f "$STATE_FILE" ]; then
         # shellcheck disable=SC1090
         source "$STATE_FILE"
-        DASHBOARD_TITLE="${USER_TITLE:-${SWARM_TITLE:-claude-swarm}}"
+        DASHBOARD_TITLE="${USER_TITLE:-${SWARM_TITLE:-swarm}}"
         NUM_AGENTS="${SWARM_NUM_AGENTS:-$NUM_AGENTS}"
         SWARM_PROMPT="${SWARM_PROMPT:-$SWARM_PROMPT}"
         MODEL_SUMMARY="${SWARM_MODEL_SUMMARY:-$MODEL_SUMMARY}"
@@ -229,29 +239,22 @@ draw() {
         local state
         state=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "not found")
 
-        local model="unknown" effort="" auth_mode="" context_mode=""
+        local model="unknown" effort="" auth_mode=""
         if [ "$state" != "not found" ]; then
             local env_dump
             env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
                 "$name" 2>/dev/null || true)
-            model=$(printf '%s' "$env_dump" | grep '^CLAUDE_MODEL=' | head -1 | cut -d= -f2- || true)
+            model=$(printf '%s' "$env_dump" | grep '^OPENCODE_MODEL=' | head -1 | cut -d= -f2- || true)
             model="${model:-unknown}"
-            effort=$(printf '%s' "$env_dump" | grep '^CLAUDE_CODE_EFFORT_LEVEL=' | head -1 | cut -d= -f2- || true)
-            context_mode=$(printf '%s' "$env_dump" | grep '^SWARM_CONTEXT=' | head -1 | cut -d= -f2- || true)
+            effort=$(printf '%s' "$env_dump" | grep '^OPENCODE_EFFORT=' | head -1 | cut -d= -f2- || true)
             auth_mode=$(printf '%s' "$env_dump" | grep '^SWARM_AUTH_MODE=' | head -1 | cut -d= -f2- || true)
-            # Auto-detect auth source when not explicitly set.
+            # Auto-detect auth source.
             if [ -z "$auth_mode" ]; then
-                local has_apikey has_oauth
-                has_apikey=$(printf '%s' "$env_dump" | grep '^ANTHROPIC_API_KEY=' | head -1 | cut -d= -f2- || true)
-                has_oauth=$(printf '%s' "$env_dump" | grep '^CLAUDE_CODE_OAUTH_TOKEN=' | head -1 | cut -d= -f2- || true)
-                if [ -n "$has_oauth" ] && [ -z "$has_apikey" ]; then
-                    auth_mode="oauth"
-                elif [ -n "$has_apikey" ] && [ -z "$has_oauth" ]; then
-                    auth_mode="apikey"
-                fi
+                auth_mode="auth.json"
             fi
         fi
-        local short="${model/claude-/}"
+        local short
+        short="$(shorten_model "$model")"
         if [ -n "$effort" ]; then
             local eff_tag="${effort:0:1}"
             short="${short} [${eff_tag^^}]"
@@ -327,22 +330,16 @@ draw() {
         local pp_env_dump
         pp_env_dump=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' \
             "$pp_name" 2>/dev/null || true)
-        pp_model=$(printf '%s' "$pp_env_dump" | grep '^CLAUDE_MODEL=' | head -1 | cut -d= -f2- || true)
+        pp_model=$(printf '%s' "$pp_env_dump" | grep '^OPENCODE_MODEL=' | head -1 | cut -d= -f2- || true)
         pp_model="${pp_model:-unknown}"
-        pp_effort=$(printf '%s' "$pp_env_dump" | grep '^CLAUDE_CODE_EFFORT_LEVEL=' | head -1 | cut -d= -f2- || true)
+        pp_effort=$(printf '%s' "$pp_env_dump" | grep '^OPENCODE_EFFORT=' | head -1 | cut -d= -f2- || true)
         pp_context_mode=$(printf '%s' "$pp_env_dump" | grep '^SWARM_CONTEXT=' | head -1 | cut -d= -f2- || true)
         pp_auth_mode=$(printf '%s' "$pp_env_dump" | grep '^SWARM_AUTH_MODE=' | head -1 | cut -d= -f2- || true)
         if [ -z "$pp_auth_mode" ]; then
-            local pp_has_apikey pp_has_oauth
-            pp_has_apikey=$(printf '%s' "$pp_env_dump" | grep '^ANTHROPIC_API_KEY=' | head -1 | cut -d= -f2- || true)
-            pp_has_oauth=$(printf '%s' "$pp_env_dump" | grep '^CLAUDE_CODE_OAUTH_TOKEN=' | head -1 | cut -d= -f2- || true)
-            if [ -n "$pp_has_oauth" ] && [ -z "$pp_has_apikey" ]; then
-                pp_auth_mode="oauth"
-            elif [ -n "$pp_has_apikey" ] && [ -z "$pp_has_oauth" ]; then
-                pp_auth_mode="apikey"
-            fi
+            pp_auth_mode="auth.json"
         fi
-        local pp_short="${pp_model/claude-/}"
+        local pp_short
+        pp_short="$(shorten_model "$pp_model")"
         if [ -n "$pp_effort" ]; then
             local pp_eff_tag="${pp_effort:0:1}"
             pp_short="${pp_short} [${pp_eff_tag^^}]"

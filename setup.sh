@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Interactive setup wizard for claude-swarm.
+# Interactive setup wizard for swarm.
 # Produces a swarm.json config file.
 # Uses whiptail for dialogs; falls back to read-based prompts.
 
@@ -14,19 +14,20 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     cat <<HELP
 Usage: $0
 
-Interactive setup wizard for claude-swarm.
+Interactive setup wizard for swarm.
 Generates a swarm.json config file in the repo root.
 
 Walks through: credentials, prompt file, agent groups (model,
-count, custom endpoints, auth source), advanced settings
-(setup script, idle limit, git user), and post-processing.
+count, custom endpoints), advanced settings (setup script,
+idle limit, git user), and post-processing.
 
 Output:
   \$REPO_ROOT/swarm.json   Generated config file.
 
-Environment (auto-detected if set):
-  ANTHROPIC_API_KEY         API key.
-  CLAUDE_CODE_OAUTH_TOKEN   OAuth token for subscription auth.
+Auth:
+  Checks for ~/.local/share/opencode/auth.json (created by
+  'opencode auth'). Per-agent api_key fields can be set for
+  custom endpoints.
 HELP
     exit 0
 fi
@@ -39,7 +40,7 @@ fi
 
 msg() {
     if $USE_WHIPTAIL; then
-        whiptail --title "claude-swarm" --msgbox "$1" 10 60
+        whiptail --title "swarm" --msgbox "$1" 10 60
     else
         echo ""
         echo "$1"
@@ -50,7 +51,7 @@ msg() {
 input() {
     local title="$1" default="$2"
     if $USE_WHIPTAIL; then
-        whiptail --title "claude-swarm" --inputbox "$title" 10 60 "$default" 3>&1 1>&2 2>&3 || echo "$default"
+        whiptail --title "swarm" --inputbox "$title" 10 60 "$default" 3>&1 1>&2 2>&3 || echo "$default"
     else
         local val
         read -rp "$title [$default]: " val
@@ -61,7 +62,7 @@ input() {
 password() {
     local title="$1"
     if $USE_WHIPTAIL; then
-        whiptail --title "claude-swarm" --passwordbox "$title" 10 60 3>&1 1>&2 2>&3 || echo ""
+        whiptail --title "swarm" --passwordbox "$title" 10 60 3>&1 1>&2 2>&3 || echo ""
     else
         local val
         read -rsp "$title: " val
@@ -73,7 +74,7 @@ password() {
 yesno() {
     local title="$1"
     if $USE_WHIPTAIL; then
-        whiptail --title "claude-swarm" --yesno "$title" 10 60 && return 0 || return 1
+        whiptail --title "swarm" --yesno "$title" 10 60 && return 0 || return 1
     else
         local val
         read -rp "$title [Y/n]: " val
@@ -86,40 +87,26 @@ yesno() {
 
 # ---- Gather settings ----
 
-echo "claude-swarm setup wizard"
-echo "========================="
+echo "swarm setup wizard"
+echo "==================="
 echo ""
 
-# 1. Authentication (API key and/or OAuth token).
-API_KEY="${ANTHROPIC_API_KEY:-}"
-OAUTH_TOKEN="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+# 1. Authentication (auth.json).
+OPENCODE_AUTH_JSON="${HOME}/.local/share/opencode/auth.json"
 
-if [ -n "$OAUTH_TOKEN" ]; then
-    echo "CLAUDE_CODE_OAUTH_TOKEN detected in environment (${#OAUTH_TOKEN} chars)."
-fi
-if [ -n "$API_KEY" ]; then
-    echo "ANTHROPIC_API_KEY detected in environment (${#API_KEY} chars)."
-fi
-
-if [ -z "$API_KEY" ] && [ -z "$OAUTH_TOKEN" ]; then
-    echo "No credentials detected. You can set one or both."
+if [ -f "$OPENCODE_AUTH_JSON" ]; then
+    echo "OpenCode auth.json detected at ${OPENCODE_AUTH_JSON}."
+else
+    echo "No auth.json found at ${OPENCODE_AUTH_JSON}."
+    echo "Run 'opencode auth' to create it, or use per-agent api_key fields."
     echo ""
-    if yesno "Set an API key?"; then
-        API_KEY=$(password "Enter your ANTHROPIC_API_KEY")
-    fi
-    if yesno "Set an OAuth token? (for Pro/Max/Teams/Enterprise)"; then
-        OAUTH_TOKEN=$(password "Enter your CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token')")
-    fi
-    if [ -z "$API_KEY" ] && [ -z "$OAUTH_TOKEN" ]; then
-        echo "ERROR: At least one credential is required." >&2
+    if ! yesno "Continue without auth.json?"; then
         exit 1
     fi
-    echo ""
-    [ -n "$API_KEY" ] && echo "Tip: export ANTHROPIC_API_KEY before running launch.sh."
-    [ -n "$OAUTH_TOKEN" ] && echo "Tip: export CLAUDE_CODE_OAUTH_TOKEN before running launch.sh."
 fi
 
 # 2. Prompt file.
+echo ""
 PROMPT_PATH=$(input "Path to prompt file (relative to repo root)" "")
 if [ -z "$PROMPT_PATH" ]; then
     echo "ERROR: Prompt file is required." >&2
@@ -141,7 +128,7 @@ while true; do
     echo ""
     echo "--- Agent group ${GROUP_NUM} ---"
 
-    MODEL=$(input "Model name" "claude-opus-4-6")
+    MODEL=$(input "Model name (provider/model format)" "anthropic/claude-opus-4-6")
     COUNT=$(input "Number of agents with this model" "1")
 
     AGENT_OBJ="{\"count\": ${COUNT}, \"model\": \"${MODEL}\""
@@ -155,9 +142,9 @@ while true; do
     esac
 
     echo "  Context mode (full/slim/none, blank for full):"
-    echo "    full = keep .claude/ as-is"
-    echo "    slim = keep only CLAUDE.md, strip skills/agents"
-    echo "    none = remove entire .claude/ (bare agent)"
+    echo "    full = keep .opencode/ as-is"
+    echo "    slim = keep only CLAUDE.md, strip agents/skills"
+    echo "    none = remove entire .opencode/ (bare agent)"
     CONTEXT=$(input "Context mode" "")
     case "$CONTEXT" in
         slim|none) AGENT_OBJ+=", \"context\": \"${CONTEXT}\"" ;;
@@ -170,27 +157,13 @@ while true; do
         AGENT_OBJ+=", \"prompt\": \"${GPROMPT}\""
     fi
 
-    if yesno "Custom endpoint for this group (e.g. OpenRouter)?"; then
+    if yesno "Custom endpoint for this group?"; then
         BASE_URL=$(input "Base URL" "https://openrouter.ai/api/v1")
         GROUP_KEY=$(password "API key for this endpoint")
         AGENT_OBJ+=", \"base_url\": \"${BASE_URL}\""
         if [ -n "$GROUP_KEY" ]; then
             AGENT_OBJ+=", \"api_key\": \"${GROUP_KEY}\""
         fi
-    elif [ -n "$API_KEY" ] && [ -n "$OAUTH_TOKEN" ]; then
-        echo "  Auth source for this group:"
-        echo "    1) auto (pass both API key + OAuth token; CLI decides)"
-        echo "    2) apikey (API key only)"
-        echo "    3) oauth (subscription/OAuth token only)"
-        AUTH_CHOICE=$(input "Choice [1/2/3]" "1")
-        case "$AUTH_CHOICE" in
-            2) AGENT_OBJ+=", \"auth\": \"apikey\"" ;;
-            3) AGENT_OBJ+=", \"auth\": \"oauth\"" ;;
-        esac
-    elif [ -n "$OAUTH_TOKEN" ]; then
-        AGENT_OBJ+=", \"auth\": \"oauth\""
-    elif [ -n "$API_KEY" ]; then
-        AGENT_OBJ+=", \"auth\": \"apikey\""
     fi
 
     AGENT_OBJ+="}"
@@ -226,7 +199,7 @@ POST_EFFORT=""
 
 if yesno "Configure post-processing (runs after all agents finish)?"; then
     POST_PROMPT=$(input "Post-processing prompt file" "")
-    POST_MODEL=$(input "Model for post-processing" "claude-opus-4-6")
+    POST_MODEL=$(input "Model for post-processing" "anthropic/claude-opus-4-6")
     echo "  Reasoning effort for post-processing (low/medium/high, blank to skip):"
     POST_EFFORT=$(input "Effort level" "")
     case "$POST_EFFORT" in
@@ -279,8 +252,6 @@ if yesno "Write ${OUTPUT}?"; then
     echo "Config written to ${OUTPUT}"
     echo ""
     if yesno "Launch swarm now?"; then
-        [ -n "$API_KEY" ] && export ANTHROPIC_API_KEY="$API_KEY"
-        [ -n "$OAUTH_TOKEN" ] && export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH_TOKEN"
         "$SWARM_DIR/launch.sh" start
     fi
 else

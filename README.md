@@ -1,6 +1,6 @@
-# claude-swarm
+# swarm
 
-N Claude Code instances in Docker, coordinating through git.
+N OpenCode instances in Docker, coordinating through git.
 No orchestrator, no message passing.
 
 Based on the agent-team pattern from
@@ -10,13 +10,13 @@ Based on the agent-team pattern from
 
 - Docker
 - bash, git, jq, bc
-- An Anthropic API key, OAuth token, or compatible endpoint
+- [OpenCode CLI](https://opencode.ai) with auth configured
 
 ## Setup
 
 Add as a submodule:
 
-    git submodule add <url> tools/claude-swarm
+    git submodule add <url> tools/swarm
 
 ## How it works
 
@@ -46,15 +46,15 @@ Each container runs `lib/harness.sh`:
 1. Clones `/upstream` to `/workspace`.
 2. Points submodule URLs at local read-only mirrors.
 3. Runs an optional setup hook (`SWARM_SETUP`).
-4. Loops: reset to `origin/agent-work`, run one Claude
-   session with `--output-format stream-json`.
+4. Loops: reset to `origin/agent-work`, run one OpenCode
+   session with `--format json`.
 
 Agent activity (tool calls, file edits, shell commands)
 streams to Docker logs in real time via `lib/activity-filter.sh`.
 Press `[1-9]` in the dashboard to watch what an agent is doing.
 
 Agents stop after `SWARM_MAX_IDLE` consecutive idle sessions.
-A session is one `claude` invocation. After it exits the
+A session is one `opencode run` invocation. After it exits the
 harness checks whether `agent-work` advanced. If not, the
 idle counter increments. Any push resets it.
 
@@ -71,89 +71,101 @@ with `SWARM_CONFIG=/path/to/config.json`:
   "setup": "scripts/setup.sh",
   "max_idle": 3,
   "agents": [
-    { "count": 2, "model": "claude-opus-4-6", "effort": "high", "auth": "apikey" },
-    { "count": 1, "model": "claude-opus-4-6", "context": "none" },
-    { "count": 1, "model": "claude-sonnet-4-6", "effort": "low", "prompt": "prompts/review.md" },
+    { "count": 2, "model": "anthropic/claude-opus-4-6", "effort": "high" },
+    { "count": 1, "model": "anthropic/claude-opus-4-6", "context": "none" },
+    { "count": 1, "model": "anthropic/claude-sonnet-4-6", "effort": "low", "prompt": "prompts/review.md" },
     {
       "count": 3,
       "model": "openrouter/custom",
-      "base_url": "https://openrouter.ai/api/v1",
       "api_key": "sk-or-..."
     }
   ],
   "inject_git_rules": true,
   "post_process": {
     "prompt": "prompts/review.md",
-    "model": "claude-opus-4-6",
+    "model": "anthropic/claude-opus-4-6",
     "effort": "low"
   }
 }
 ```
 
-Groups without `api_key` use `ANTHROPIC_API_KEY` or
-`CLAUDE_CODE_OAUTH_TOKEN` from the environment. Total
+Auth is handled via `~/.local/share/opencode/auth.json`,
+mounted read-only into containers. Per-agent `api_key`
+fields generate per-container OpenCode configs. Total
 agents = sum of `count` fields. Requires `jq`.
+
+Model names use `provider/model` format. Bare names
+(e.g. `claude-opus-4-6`) are auto-prefixed with
+`anthropic/`.
 
 **Fields:**
 
 | Field | Values | Notes |
 |-------|--------|-------|
 | `prompt` | file path | Per-group prompt override (default: top-level `prompt`). |
-| `effort` | `low`, `medium`, `high` | Adaptive reasoning depth. Opus/Sonnet 4.6+. |
-| `context` | `full`, `slim`, `none` | How much of `.claude/` to keep (default: `full`). |
-| `auth` | `apikey`, `oauth`, omit | Which credential to inject. Omit = both. |
-| `inject_git_rules` | `true`, `false` | Append git coordination rules to system prompt. |
+| `effort` | `low`, `medium`, `high`, or any string | Maps to `--variant`. Unknown values pass through as-is. |
+| `context` | `full`, `slim`, `none` | How much of `.opencode/` to keep (default: `full`). |
+| `inject_git_rules` | `true`, `false` | Append git coordination rules to prompt. |
 
-Groups with `api_key`/`base_url` ignore `auth`; their own
-key is always used. The dashboard shows auth per agent.
+Groups with `api_key` use their own key. The dashboard
+shows auth per agent.
 
 ### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | | API key (or `CLAUDE_CODE_OAUTH_TOKEN`). |
-| `CLAUDE_CODE_OAUTH_TOKEN` | | OAuth token via `claude setup-token`. |
 | `SWARM_PROMPT` | (required) | Prompt file path. |
 | `SWARM_CONFIG` | | Config file path. |
 | `SWARM_SETUP` | | Setup script path. |
-| `SWARM_MODEL` | `claude-opus-4-6` | Model. |
+| `SWARM_MODEL` | `claude-opus-4-6` | Model (auto-prefixed). |
 | `SWARM_NUM_AGENTS` | `3` | Container count. |
 | `SWARM_MAX_IDLE` | `3` | Idle sessions before exit. |
 | `SWARM_EFFORT` | | Reasoning effort. |
 | `SWARM_INJECT_GIT_RULES` | `true` | Inject git rules. |
 | `SWARM_GIT_USER_NAME` | `swarm-agent` | Git author name. |
 | `SWARM_GIT_USER_EMAIL` | `agent@claude-swarm.local` | Git email. |
-| `ANTHROPIC_BASE_URL` | | Override API URL. |
-| `ANTHROPIC_AUTH_TOKEN` | | Override auth token. |
 
 Config file takes precedence when present.
 
 ### Third-party models
 
-Any Anthropic-compatible endpoint works. Per-group via
-`base_url`/`api_key`, or globally:
+Use `provider/model` format in the config:
 
-    ANTHROPIC_API_KEY="sk-..." \
-    ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic" \
-    SWARM_MODEL="MiniMax-M2.5" \
-    SWARM_PROMPT="tasks/task.md" \
-    ./launch.sh start
+```json
+{
+  "agents": [
+    {
+      "count": 3,
+      "model": "openrouter/custom",
+      "api_key": "sk-or-..."
+    }
+  ]
+}
+```
 
-### Subscription auth (Pro/Max/Teams/Enterprise)
+Per-agent `api_key` and optional `base_url` generate
+per-container OpenCode configuration files.
 
-Generate an OAuth token on the host:
+**Example: OpenAI GPT-5.4 with extra-high reasoning**
 
-    claude setup-token
+```json
+{
+  "prompt": "prompts/task.md",
+  "agents": [
+    {
+      "count": 2,
+      "model": "openai/gpt-5.4",
+      "effort": "extra_high",
+      "api_key": "$OPENAI_API_KEY"
+    }
+  ]
+}
+```
 
-Then launch with it:
-
-    CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-..." \
-    SWARM_PROMPT="tasks/task.md" \
-    ./launch.sh start
-
-Both credentials can coexist; the CLI decides which to use.
-Per-agent `api_key` in `swarm.json` still works for the
-API-key flow.
+Known effort aliases (`low`→`minimal`, `medium`→`high`,
+`high`→`max`) are translated; any other value (like
+`extra_high`) passes through to `opencode run --variant`
+as-is, so provider-specific reasoning levels work directly.
 
 ## Commands and usage
 

@@ -6,7 +6,6 @@
     ./setup.sh
 
     # Or configure via environment.
-    ANTHROPIC_API_KEY="sk-ant-..." \
     SWARM_PROMPT="path/to/prompt.md" \
     ./launch.sh start
 
@@ -49,8 +48,9 @@ what an agent is doing:
     12:35:15   agent[1] Shell: git push origin agent-work
     12:35:18 harness[1] session end cost=$0.12 in=800 out=644 turns=6 time=19s
 
-The filter (`lib/activity-filter.sh`) parses `stream-json`
-events from the Claude CLI and prints one line per tool call.
+The filter (`lib/activity-filter.sh`) parses NDJSON events
+from `opencode run --format json` and prints one line per
+tool call.
 
 ## Testing
 
@@ -104,7 +104,7 @@ Add to `swarm.json`:
 {
   "post_process": {
     "prompt": "prompts/review.md",
-    "model": "claude-opus-4-6",
+    "model": "anthropic/claude-opus-4-6",
     "effort": "low"
   }
 }
@@ -124,21 +124,21 @@ can reduce agent success rates while increasing inference cost by
 over 20%. This feature enables A/B comparisons within a single
 swarm.
 
-Control how much of `.claude/` each agent group sees:
+Control how much of `.opencode/` each agent group sees:
 
 | Mode | Behavior |
 |------|----------|
-| `full` | Keep `.claude/` as-is (default). |
-| `slim` | Keep only `.claude/CLAUDE.md`, strip agents/skills. |
-| `none` | Remove entire `.claude/` directory (bare agent). |
+| `full` | Keep `.opencode/` as-is (default). |
+| `slim` | Keep only `CLAUDE.md`, strip agents/skills. |
+| `none` | Remove entire `.opencode/` directory (bare agent). |
 
 Set per group in `swarm.json`:
 
 ```json
 {
   "agents": [
-    { "count": 2, "model": "claude-opus-4-6" },
-    { "count": 1, "model": "claude-opus-4-6", "context": "none" }
+    { "count": 2, "model": "anthropic/claude-opus-4-6" },
+    { "count": 1, "model": "anthropic/claude-opus-4-6", "context": "none" }
   ]
 }
 ```
@@ -156,8 +156,8 @@ Each agent group can run a different prompt file:
 {
   "prompt": "tasks/hunt.md",
   "agents": [
-    { "count": 2, "model": "claude-opus-4-6" },
-    { "count": 1, "model": "claude-sonnet-4-6",
+    { "count": 2, "model": "anthropic/claude-opus-4-6" },
+    { "count": 1, "model": "anthropic/claude-sonnet-4-6",
       "prompt": "tasks/review.md" }
   ]
 }
@@ -170,8 +170,8 @@ runs a different prompt to validate and normalize findings.
 
 ## Git coordination
 
-Agents receive git rules (commit/push/rebase) via a system
-prompt appendix. Your task prompt only needs to describe the
+Agents receive git rules (commit/push/rebase) via prompt
+concatenation. Your task prompt only needs to describe the
 work.
 
 Disable with `"inject_git_rules": false` in `swarm.json` or
@@ -187,18 +187,18 @@ Stats collected per session inside each container
 
 Dashboard columns:
 
-- **Ctx** — context mode: `bare` (no `.claude/`), `slim`
+- **Ctx** -- context mode: `bare` (no `.opencode/`), `slim`
   (only `CLAUDE.md`), or blank for full context.
-- **Cost** — cumulative API cost in USD.
-- **In/Out** — input and output tokens.
-- **Cache** — prompt cache read tokens. Higher means the API
+- **Cost** -- cumulative API cost in USD.
+- **In/Out** -- input and output tokens.
+- **Cache** -- prompt cache read tokens. Higher means the API
   is reusing cached context instead of reprocessing it,
   reducing cost and latency. Cache creation tokens (the
   one-time cost of populating the cache) are recorded in
   the TSV but not shown separately.
-- **Turns** — number of assistant turns across all sessions.
-- **Tok/s** — output tokens per second of API time.
-- **Time** — cumulative wall-clock duration.
+- **Turns** -- number of step_finish events across all sessions.
+- **Tok/s** -- output tokens per second of API time.
+- **Time** -- cumulative wall-clock duration.
 
 ## Cleanup
 
@@ -207,8 +207,7 @@ Dashboard columns:
 ## Verify image
 
     docker run --rm --entrypoint bash \
-        -e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" \
+        -v "${HOME}/.local/share/opencode/auth.json:/home/agent/.local/share/opencode/auth.json:ro" \
         $(basename $(pwd))-agent \
-        -c 'claude --dangerously-skip-permissions \
-            -p "What model are you? Reply with model id only." \
-            --model claude-opus-4-6 2>&1'
+        -c 'opencode run "What model are you? Reply with model id only." \
+            --model anthropic/claude-opus-4-6 --format json --agent swarm 2>&1'

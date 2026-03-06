@@ -1,12 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-# Reads stream-json (JSONL) from stdin and prints human-readable
-# activity summaries to stdout.  Designed to be used with:
+# Reads opencode NDJSON (--format json) from stdin and prints
+# human-readable activity summaries to stdout.  Designed to be
+# used with:
 #
-#   claude ... --output-format stream-json | tee "$LOG" | activity-filter.sh
+#   opencode run ... --format json | tee "$LOG" | activity-filter.sh
 #
-# Each tool_use content block becomes one line:
+# Each tool_use event becomes one line:
 #   12:34:56   agent[1] Read src/main.ts
 #   12:34:57   agent[1] Write src/main.ts
 #   12:34:58   agent[1] Edit src/main.ts
@@ -31,17 +32,15 @@ exec jq --unbuffered --raw-input --arg id "$AGENT_ID" -r '
     "\(ts)   agent[\($id)]";
 
   fromjson? // empty |
-  select(.type == "assistant") |
-  .message.content[]? |
   select(.type == "tool_use") |
-  if   .name == "Bash"  then "\(prefix) Shell: " + ((.input.command // "") | first_line | truncate(80))
-  elif .name == "Read"  then "\(prefix) Read "  + (.input.file_path // .input.path // "")
-  elif .name == "Write" then "\(prefix) Write " + (.input.file_path // .input.path // "")
-  elif .name == "Edit"  then "\(prefix) Edit "  + (.input.file_path // .input.path // "")
-  elif .name == "MultiEdit" then "\(prefix) MultiEdit " + (.input.file_path // .input.path // "")
-  elif .name == "Glob"  then "\(prefix) Glob "  + (.input.pattern // "")
-  elif .name == "Grep"  then "\(prefix) Grep "  + (.input.pattern // "")
-  elif .name == "Task"  then "\(prefix) Task: " + ((.input.description // .input.prompt // "") | first_line | truncate(60))
-  else "\(prefix) " + .name
+  .part as $p |
+  if   $p.tool == "bash"  then "\(prefix) Shell: " + (($p.state.input.command // "") | first_line | truncate(80))
+  elif $p.tool == "read"  then "\(prefix) Read "  + ($p.state.input.filePath // $p.state.input.file_path // "")
+  elif $p.tool == "write" then "\(prefix) Write " + ($p.state.input.filePath // $p.state.input.file_path // "")
+  elif $p.tool == "edit"  then "\(prefix) Edit "  + ($p.state.input.filePath // $p.state.input.file_path // "")
+  elif $p.tool == "glob"  then "\(prefix) Glob "  + ($p.state.input.pattern // "")
+  elif $p.tool == "grep"  then "\(prefix) Grep "  + ($p.state.input.pattern // "")
+  elif $p.tool == "task"  then "\(prefix) Task: " + (($p.state.input.description // "") | first_line | truncate(60))
+  else "\(prefix) " + ($p.tool // "unknown")
   end
 '

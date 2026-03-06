@@ -1,5 +1,10 @@
 # Global Context (Always-on)
 
+This project uses OpenCode CLI as the AI
+backend inside Docker containers. Auth is via mounted
+`~/.local/share/opencode/auth.json`. Model names use
+`provider/model` format (e.g. `anthropic/claude-opus-4-6`).
+
 ## Epistemics
 
 - Do not fabricate results, measurements, outputs, behaviors,

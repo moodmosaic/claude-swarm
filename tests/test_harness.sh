@@ -39,107 +39,116 @@ assert_contains() {
 strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 
 # --- Helpers: same extraction logic used in harness.sh ---
-# The harness now uses stream-json (JSONL) output. Stats come from
-# the "result" line. For backward compat the helper also accepts
-# plain JSON (single object, no "type" field).
+# The harness uses opencode NDJSON output. Stats come from
+# step_finish events, summed across all events.
 
 extract_stats() {
     local logfile="$1"
-    local RESULT_LINE
-    RESULT_LINE=$(grep '"type"[[:space:]]*:[[:space:]]*"result"' "$logfile" 2>/dev/null | tail -1 || true)
-    if [ -z "$RESULT_LINE" ]; then
-        RESULT_LINE=$(cat "$logfile" 2>/dev/null || true)
-    fi
-    local cost dur api_ms turns tok_in tok_out cache_rd cache_cr
-    cost=$(echo "$RESULT_LINE" | jq -r '.total_cost_usd // 0' 2>/dev/null || true)
+    local cost tok_in tok_out cache_rd cache_cr dur api_ms turns
+
+    cost=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.cost // 0] | add // 0' "$logfile" 2>/dev/null || echo 0)
     cost="${cost:-0}"
-    dur=$(echo "$RESULT_LINE" | jq -r '.duration_ms // 0' 2>/dev/null || true)
-    dur="${dur:-0}"
-    api_ms=$(echo "$RESULT_LINE" | jq -r '.duration_api_ms // 0' 2>/dev/null || true)
-    api_ms="${api_ms:-0}"
-    turns=$(echo "$RESULT_LINE" | jq -r '.num_turns // 0' 2>/dev/null || true)
-    turns="${turns:-0}"
-    tok_in=$(echo "$RESULT_LINE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || true)
+    tok_in=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.input // 0] | add // 0' "$logfile" 2>/dev/null || echo 0)
     tok_in="${tok_in:-0}"
-    tok_out=$(echo "$RESULT_LINE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || true)
+    tok_out=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.output // 0] | add // 0' "$logfile" 2>/dev/null || echo 0)
     tok_out="${tok_out:-0}"
-    cache_rd=$(echo "$RESULT_LINE" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || true)
+    cache_rd=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.cache.read // 0] | add // 0' "$logfile" 2>/dev/null || echo 0)
     cache_rd="${cache_rd:-0}"
-    cache_cr=$(echo "$RESULT_LINE" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || true)
+    cache_cr=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.cache.write // 0] | add // 0' "$logfile" 2>/dev/null || echo 0)
     cache_cr="${cache_cr:-0}"
+
+    local ts_start ts_end
+    ts_start=$(jq -s '[.[] | select(.type=="step_start")
+        | .timestamp // 0] | min // 0' "$logfile" 2>/dev/null || echo 0)
+    ts_end=$(jq -s '[.[] | select(.type=="step_finish")
+        | .timestamp // 0] | max // 0' "$logfile" 2>/dev/null || echo 0)
+    if [ "${ts_start:-0}" -gt 0 ] && [ "${ts_end:-0}" -gt 0 ]; then
+        dur=$(( (ts_end - ts_start) * 1000 ))
+    else
+        dur=0
+    fi
+    api_ms="$dur"
+
+    turns=$(jq -s '[.[] | select(.type=="step_finish")] | length' \
+        "$logfile" 2>/dev/null || echo 0)
+    turns="${turns:-0}"
+
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s" \
         "$(date +%s)" "$cost" "$tok_in" "$tok_out" \
         "$cache_rd" "$cache_cr" "$dur" "$api_ms" "$turns"
 }
 
 # ============================================================
-echo "=== 1. Full JSON output parsing ==="
+echo "=== 1. OpenCode NDJSON output parsing ==="
 
-cat > "$TMPDIR/full.json" <<'EOF'
-{
-  "total_cost_usd": 0.1292,
-  "duration_ms": 19000,
-  "duration_api_ms": 15000,
-  "num_turns": 6,
-  "usage": {
-    "input_tokens": 800,
-    "output_tokens": 644,
-    "cache_read_input_tokens": 117000,
-    "cache_creation_input_tokens": 5000
-  }
-}
+cat > "$TMPDIR/stream.jsonl" <<'EOF'
+{"type":"step_start","timestamp":1000,"sessionID":"s01","part":{"type":"step-start"}}
+{"type":"tool_use","timestamp":1001,"part":{"type":"tool","callID":"c1","tool":"bash","state":{"status":"success","input":{"command":"ls -la"}}}}
+{"type":"step_finish","timestamp":1020,"part":{"type":"step-finish","reason":"stop","cost":0.0823,"tokens":{"total":800,"input":500,"output":300,"reasoning":0,"cache":{"read":80000,"write":2000}}}}
 EOF
 
-LINE=$(extract_stats "$TMPDIR/full.json")
+LINE=$(extract_stats "$TMPDIR/stream.jsonl")
 IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
 
-assert_eq "cost"     "0.1292"  "$cost"
-assert_eq "tok_in"   "800"     "$tok_in"
-assert_eq "tok_out"  "644"     "$tok_out"
-assert_eq "cache_rd" "117000"  "$cache_rd"
-assert_eq "cache_cr" "5000"    "$cache_cr"
-assert_eq "dur"      "19000"   "$dur"
-assert_eq "api_ms"   "15000"   "$api_ms"
-assert_eq "turns"    "6"       "$turns"
+assert_eq "cost"     "0.0823"  "$cost"
+assert_eq "tok_in"   "500"     "$tok_in"
+assert_eq "tok_out"  "300"     "$tok_out"
+assert_eq "cache_rd" "80000"   "$cache_rd"
+assert_eq "cache_cr" "2000"    "$cache_cr"
+assert_eq "dur"      "20000"   "$dur"
+assert_eq "turns"    "1"       "$turns"
 
 # ============================================================
 echo ""
-echo "=== 2. Minimal JSON (missing fields default to 0) ==="
+echo "=== 2. Multiple step_finish events (summed) ==="
 
-cat > "$TMPDIR/minimal.json" <<'EOF'
-{ "total_cost_usd": 0.05 }
+cat > "$TMPDIR/multi.jsonl" <<'EOF'
+{"type":"step_start","timestamp":1000,"sessionID":"s01","part":{"type":"step-start"}}
+{"type":"step_finish","timestamp":1010,"part":{"type":"step-finish","reason":"stop","cost":0.05,"tokens":{"total":400,"input":200,"output":200,"cache":{"read":10000,"write":1000}}}}
+{"type":"step_start","timestamp":1010,"sessionID":"s01","part":{"type":"step-start"}}
+{"type":"step_finish","timestamp":1025,"part":{"type":"step-finish","reason":"stop","cost":0.08,"tokens":{"total":600,"input":300,"output":300,"cache":{"read":20000,"write":500}}}}
 EOF
 
-LINE=$(extract_stats "$TMPDIR/minimal.json")
+LINE=$(extract_stats "$TMPDIR/multi.jsonl")
 IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
 
-assert_eq "cost"     "0.05" "$cost"
+assert_eq "multi cost"     "0.13"   "$cost"
+assert_eq "multi tok_in"   "500"    "$tok_in"
+assert_eq "multi tok_out"  "500"    "$tok_out"
+assert_eq "multi cache_rd" "30000"  "$cache_rd"
+assert_eq "multi cache_cr" "1500"   "$cache_cr"
+assert_eq "multi dur"      "25000"  "$dur"
+assert_eq "multi turns"    "2"      "$turns"
+
+# ============================================================
+echo ""
+echo "=== 3. Missing fields default to 0 ==="
+
+cat > "$TMPDIR/minimal.jsonl" <<'EOF'
+{"type":"step_finish","timestamp":1000,"part":{"type":"step-finish","reason":"stop","cost":0.01}}
+EOF
+
+LINE=$(extract_stats "$TMPDIR/minimal.jsonl")
+IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
+
+assert_eq "cost"     "0.01" "$cost"
 assert_eq "tok_in"   "0"    "$tok_in"
 assert_eq "tok_out"  "0"    "$tok_out"
 assert_eq "cache_rd" "0"    "$cache_rd"
-assert_eq "dur"      "0"    "$dur"
-assert_eq "turns"    "0"    "$turns"
-
-# ============================================================
-echo ""
-echo "=== 3. Invalid JSON fallback ==="
-
-echo "not json at all" > "$TMPDIR/garbage.txt"
-
-LINE=$(extract_stats "$TMPDIR/garbage.txt")
-IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
-
-assert_eq "cost fallback"  "0" "$cost"
-assert_eq "turns fallback" "0" "$turns"
-assert_eq "dur fallback"   "0" "$dur"
+assert_eq "turns"    "1"    "$turns"
 
 # ============================================================
 echo ""
 echo "=== 4. Empty file fallback ==="
 
-: > "$TMPDIR/empty.json"
+: > "$TMPDIR/empty.jsonl"
 
-LINE=$(extract_stats "$TMPDIR/empty.json")
+LINE=$(extract_stats "$TMPDIR/empty.jsonl")
 IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
 
 assert_eq "cost empty"  "0" "$cost"
@@ -147,56 +156,49 @@ assert_eq "turns empty" "0" "$turns"
 
 # ============================================================
 echo ""
-echo "=== 5. Stream-JSON (JSONL) output parsing ==="
-
-cat > "$TMPDIR/stream.jsonl" <<'EOF'
-{"type":"system","subtype":"init","session_id":"s01","tools":["Bash","Read","Write"],"model":"claude-opus-4-6"}
-{"type":"assistant","session_id":"s01","message":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls -la"}}]}}
-{"type":"user","session_id":"s01","message":{"id":"msg_2","type":"message","role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"README.md\nsrc\n"}]}}
-{"type":"result","subtype":"success","session_id":"s01","total_cost_usd":0.0823,"is_error":false,"duration_ms":25000,"duration_api_ms":20000,"num_turns":4,"result":"Done.","usage":{"input_tokens":500,"output_tokens":300,"cache_read_input_tokens":80000,"cache_creation_input_tokens":2000}}
-EOF
+echo "=== 5. TSV line format ==="
 
 LINE=$(extract_stats "$TMPDIR/stream.jsonl")
-IFS=$'\t' read -r ts cost tok_in tok_out cache_rd cache_cr dur api_ms turns <<< "$LINE"
-
-assert_eq "jsonl cost"     "0.0823"  "$cost"
-assert_eq "jsonl tok_in"   "500"     "$tok_in"
-assert_eq "jsonl tok_out"  "300"     "$tok_out"
-assert_eq "jsonl cache_rd" "80000"   "$cache_rd"
-assert_eq "jsonl cache_cr" "2000"    "$cache_cr"
-assert_eq "jsonl dur"      "25000"   "$dur"
-assert_eq "jsonl api_ms"   "20000"   "$api_ms"
-assert_eq "jsonl turns"    "4"       "$turns"
-
-# ============================================================
-echo ""
-echo "=== 6. TSV line format ==="
-
-LINE=$(extract_stats "$TMPDIR/full.json")
 FIELD_COUNT=$(echo "$LINE" | awk -F'\t' '{print NF}')
 assert_eq "9 tab-separated fields" "9" "$FIELD_COUNT"
 
 # ============================================================
 echo ""
-echo "=== 7. INJECT_GIT_RULES logic ==="
+echo "=== 6. INJECT_GIT_RULES prompt concatenation ==="
 
-build_append_args() {
-    local inject="$1" file_exists="$2"
-    local -a APPEND_ARGS=()
+build_prompt() {
+    local inject="$1" file_exists="$2" task_text="base prompt"
+    local prompt_text="$task_text"
     if [ "$inject" = "true" ] && [ "$file_exists" = "true" ]; then
-        APPEND_ARGS+=(--append-system-prompt-file /agent-system-prompt.md)
+        prompt_text="${prompt_text}
+
+git rules appended"
     fi
-    echo "${#APPEND_ARGS[@]}"
+    echo "$prompt_text"
 }
 
-assert_eq "inject=true, file=true"   "2" "$(build_append_args true true)"
-assert_eq "inject=false, file=true"  "0" "$(build_append_args false true)"
-assert_eq "inject=true, file=false"  "0" "$(build_append_args true false)"
-assert_eq "inject=false, file=false" "0" "$(build_append_args false false)"
+assert_contains "inject=true, file=true" "git rules appended" \
+    "$(build_prompt true true)"
+result=$(build_prompt false true)
+if echo "$result" | grep -q "git rules"; then
+    echo "  FAIL: inject=false should not append"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS: inject=false, file=true"
+    PASS=$((PASS + 1))
+fi
+result=$(build_prompt true false)
+if echo "$result" | grep -q "git rules"; then
+    echo "  FAIL: file=false should not append"
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS: inject=true, file=false"
+    PASS=$((PASS + 1))
+fi
 
 # ============================================================
 echo ""
-echo "=== 8. Idle counter logic ==="
+echo "=== 7. Idle counter logic ==="
 
 simulate_idle() {
     local before="$1" after="$2" idle_count="$3" max_idle="$4"
@@ -219,7 +221,7 @@ assert_eq "max_idle=1 immediate"   "exit"    "$(simulate_idle abc123 abc123 0 1)
 
 # ============================================================
 echo ""
-echo "=== 8b. Prompt file guard ==="
+echo "=== 7b. Prompt file guard ==="
 
 # Mirrors the guard in harness.sh: skip session if prompt missing.
 check_prompt() {
@@ -240,7 +242,7 @@ assert_eq "present prompt runs" "run" \
 
 # ============================================================
 echo ""
-echo "=== 9. prepare-commit-msg hook appends trailers ==="
+echo "=== 8. prepare-commit-msg hook appends trailers ==="
 
 # Mirrors the hook installed by harness.sh. Exercises it against
 # a real git repo so we test actual commit behaviour.
@@ -254,8 +256,8 @@ mkdir -p "$HOOK_REPO/.git/hooks"
 cat > "$HOOK_REPO/.git/hooks/prepare-commit-msg" <<'HOOK'
 #!/bin/bash
 if ! grep -q '^Model:' "$1"; then
-    printf '\nModel: %s\nTools: claude-swarm %s, Claude Code %s\n' \
-        "$CLAUDE_MODEL" "$SWARM_VERSION" "$CLAUDE_VERSION" >> "$1"
+    printf '\nModel: %s\nTools: swarm %s, OpenCode %s\n' \
+        "$OPENCODE_MODEL" "$SWARM_VERSION" "$OPENCODE_VERSION" >> "$1"
     printf '> Run: %s\n' "$SWARM_RUN_CONTEXT" >> "$1"
     cfg="$SWARM_CFG_PROMPT"
     [ -n "$SWARM_CFG_SETUP" ] && cfg="${cfg}, ${SWARM_CFG_SETUP}"
@@ -271,7 +273,7 @@ chmod +x "$HOOK_REPO/.git/hooks/prepare-commit-msg"
 # Commit with prompt + setup (full context = no context trailer).
 touch "$HOOK_REPO/file.txt"
 git -C "$HOOK_REPO" add file.txt
-CLAUDE_MODEL="claude-opus-4-6" CLAUDE_VERSION="1.0.32" SWARM_VERSION="0.1.0" \
+OPENCODE_MODEL="anthropic/claude-opus-4-6" OPENCODE_VERSION="0.1.0" SWARM_VERSION="0.7.0" \
     SWARM_RUN_CONTEXT="netherfuzz@a3f8c21 (main)" \
     SWARM_CFG_PROMPT="prompts/task.md" SWARM_CFG_SETUP="scripts/setup.sh" \
     SWARM_CONTEXT="full" \
@@ -279,10 +281,10 @@ CLAUDE_MODEL="claude-opus-4-6" CLAUDE_VERSION="1.0.32" SWARM_VERSION="0.1.0" \
 
 MSG=$(git -C "$HOOK_REPO" log -1 --format='%B')
 assert_eq "hook model trailer" \
-    "Model: claude-opus-4-6" \
+    "Model: anthropic/claude-opus-4-6" \
     "$(echo "$MSG" | grep '^Model:')"
 assert_eq "hook tools trailer" \
-    "Tools: claude-swarm 0.1.0, Claude Code 1.0.32" \
+    "Tools: swarm 0.7.0, OpenCode 0.1.0" \
     "$(echo "$MSG" | grep '^Tools:')"
 assert_eq "hook run trailer" \
     "> Run: netherfuzz@a3f8c21 (main)" \
@@ -300,7 +302,7 @@ assert_eq "hook subject preserved" \
 # Second commit with bare context (context=none trailer should appear).
 echo "x" > "$HOOK_REPO/file2.txt"
 git -C "$HOOK_REPO" add file2.txt
-CLAUDE_MODEL="MiniMax-M2.5" CLAUDE_VERSION="1.0.30" SWARM_VERSION="0.1.0" \
+OPENCODE_MODEL="anthropic/MiniMax-M2.5" OPENCODE_VERSION="0.1.0" SWARM_VERSION="0.7.0" \
     SWARM_RUN_CONTEXT="gethfuzz@b4e9d12 (develop)" \
     SWARM_CFG_PROMPT="prompts/fuzz.md" SWARM_CFG_SETUP="" \
     SWARM_CONTEXT="none" \
@@ -308,10 +310,10 @@ CLAUDE_MODEL="MiniMax-M2.5" CLAUDE_VERSION="1.0.30" SWARM_VERSION="0.1.0" \
 
 MSG2=$(git -C "$HOOK_REPO" log -1 --format='%B')
 assert_eq "hook model trailer 2" \
-    "Model: MiniMax-M2.5" \
+    "Model: anthropic/MiniMax-M2.5" \
     "$(echo "$MSG2" | grep '^Model:')"
 assert_eq "hook tools trailer 2" \
-    "Tools: claude-swarm 0.1.0, Claude Code 1.0.30" \
+    "Tools: swarm 0.7.0, OpenCode 0.1.0" \
     "$(echo "$MSG2" | grep '^Tools:')"
 assert_eq "hook run trailer 2" \
     "> Run: gethfuzz@b4e9d12 (develop)" \
@@ -326,7 +328,7 @@ assert_eq "hook ctx trailer (none)" \
 # Idempotent: if trailers already present, hook does not duplicate.
 echo "y" > "$HOOK_REPO/file3.txt"
 git -C "$HOOK_REPO" add file3.txt
-CLAUDE_MODEL="claude-opus-4-6" CLAUDE_VERSION="1.0.32" SWARM_VERSION="0.1.0" \
+OPENCODE_MODEL="anthropic/claude-opus-4-6" OPENCODE_VERSION="0.1.0" SWARM_VERSION="0.7.0" \
     SWARM_RUN_CONTEXT="test@abc1234 (main)" \
     SWARM_CFG_PROMPT="p.md" SWARM_CFG_SETUP="" \
     SWARM_CONTEXT="full" \
@@ -338,33 +340,18 @@ assert_eq "hook no duplicate" "1" "$MODEL_COUNT"
 
 # ============================================================
 echo ""
-echo "=== 10. Version string stripping ==="
+echo "=== 9. Version string stripping ==="
 
-# Mirrors the CLAUDE_VERSION="${CLAUDE_VERSION%% *}" in harness.sh.
+# Mirrors the OPENCODE_VERSION="${OPENCODE_VERSION%% *}" in harness.sh.
 strip_version() { local v="$1"; echo "${v%% *}"; }
 
-assert_eq "strip suffix"   "2.1.52"  "$(strip_version '2.1.52 (Claude Code)')"
-assert_eq "no suffix"      "2.1.52"  "$(strip_version '2.1.52')"
+assert_eq "strip suffix"   "0.1.52"  "$(strip_version '0.1.52 (OpenCode)')"
+assert_eq "no suffix"      "0.1.52"  "$(strip_version '0.1.52')"
 assert_eq "unknown"         "unknown" "$(strip_version 'unknown')"
 
 # ============================================================
 echo ""
-echo "=== 11. Attribution settings file ==="
-
-# Mirrors the .claude/settings.local.json written by harness.sh.
-ATTR_JSON='{"attribution":{"commit":"","pr":""}}'
-echo "$ATTR_JSON" > "$TMPDIR/settings.local.json"
-
-assert_eq "attr valid JSON" "true" \
-    "$(jq empty "$TMPDIR/settings.local.json" 2>/dev/null && echo true || echo false)"
-assert_eq "attr commit empty" "" \
-    "$(echo "$ATTR_JSON" | jq -r '.attribution.commit')"
-assert_eq "attr pr empty" "" \
-    "$(echo "$ATTR_JSON" | jq -r '.attribution.pr')"
-
-# ============================================================
-echo ""
-echo "=== 12. hlog output format ==="
+echo "=== 10. hlog output format ==="
 
 # Mirrors the log functions from harness.sh.
 GREEN=$'\033[32m'
@@ -430,6 +417,30 @@ assert_eq "hlog_pipe two lines" "2" "$PIPE_LINES"
 assert_contains "hlog_pipe line1" "harness[7] line one" "$PIPE_PLAIN"
 assert_contains "hlog_pipe line2" "harness[7] line two" "$PIPE_PLAIN"
 assert_contains "hlog_pipe green" $'\033[32m' "$PIPE_OUT"
+
+# ============================================================
+echo ""
+echo "=== 11. Effort-to-variant mapping ==="
+
+# Mirrors the case statement in harness.sh.
+map_effort() {
+    local OPENCODE_EFFORT="$1" VARIANT_ARG=""
+    case "${OPENCODE_EFFORT}" in
+        "")     ;;
+        low)    VARIANT_ARG="--variant minimal" ;;
+        medium) VARIANT_ARG="--variant high" ;;
+        high)   VARIANT_ARG="--variant max" ;;
+        *)      VARIANT_ARG="--variant ${OPENCODE_EFFORT}" ;;
+    esac
+    echo "$VARIANT_ARG"
+}
+
+assert_eq "effort low"        "--variant minimal" "$(map_effort low)"
+assert_eq "effort medium"     "--variant high"    "$(map_effort medium)"
+assert_eq "effort high"       "--variant max"     "$(map_effort high)"
+assert_eq "effort empty"      ""                  "$(map_effort "")"
+assert_eq "effort passthrough" "--variant extra_high" \
+    "$(map_effort extra_high)"
 
 # ============================================================
 echo ""

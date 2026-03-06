@@ -1,22 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-# Container entrypoint: clone, setup, loop claude sessions.
+# Container entrypoint: clone, setup, loop opencode sessions.
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
     cat <<HELP
 Usage: $0
 
-Container entrypoint for claude-swarm agents. Not intended to
-be run directly -- launched automatically inside Docker by
-launch.sh.
+Container entrypoint for swarm agents. Not intended to be run
+directly -- launched automatically inside Docker by launch.sh.
 
-Clones the bare repo, runs optional setup, then loops claude
+Clones the bare repo, runs optional setup, then loops opencode
 sessions until the agent is idle for MAX_IDLE cycles.
 
 Required environment:
   SWARM_PROMPT   Path to prompt file (relative to repo root).
-  CLAUDE_MODEL   Model to use for claude sessions.
+  OPENCODE_MODEL Model to use for opencode sessions.
 
 Optional environment:
   AGENT_ID       Agent identifier (default: unnamed).
@@ -24,17 +23,19 @@ Optional environment:
   MAX_IDLE       Idle sessions before exit (default: 3).
   INJECT_GIT_RULES  Inject git coordination rules (default: true).
   SWARM_CONTEXT  Context mode: full (default), slim, or none.
+  OPENCODE_EFFORT  Reasoning effort: low, medium, high.
 HELP
     exit 0
 fi
 
 AGENT_ID="${AGENT_ID:-unnamed}"
-CLAUDE_MODEL="${CLAUDE_MODEL:-claude-opus-4-6}"
+OPENCODE_MODEL="${OPENCODE_MODEL:-anthropic/claude-opus-4-6}"
 SWARM_PROMPT="${SWARM_PROMPT:?SWARM_PROMPT is required.}"
 SWARM_SETUP="${SWARM_SETUP:-}"
 MAX_IDLE="${MAX_IDLE:-3}"
 INJECT_GIT_RULES="${INJECT_GIT_RULES:-true}"
 SWARM_CONTEXT="${SWARM_CONTEXT:-full}"
+OPENCODE_EFFORT="${OPENCODE_EFFORT:-}"
 STATS_FILE="agent_logs/stats_agent_${AGENT_ID}.tsv"
 
 GREEN=$'\033[32m'
@@ -64,14 +65,26 @@ git config --global user.name "$GIT_USER_NAME"
 git config --global user.email "$GIT_USER_EMAIL"
 
 # Capture CLI version once for the prepare-commit-msg hook.
-CLAUDE_VERSION=$(claude --version 2>/dev/null || echo "unknown")
-CLAUDE_VERSION="${CLAUDE_VERSION%% *}"
-export CLAUDE_VERSION
+OPENCODE_VERSION=$(opencode --version 2>/dev/null || echo "unknown")
+OPENCODE_VERSION="${OPENCODE_VERSION%% *}"
+export OPENCODE_VERSION
 export SWARM_RUN_CONTEXT="${SWARM_RUN_CONTEXT:-unknown}"
 export SWARM_CFG_PROMPT="${SWARM_CFG_PROMPT:-${SWARM_PROMPT}}"
 export SWARM_CFG_SETUP="${SWARM_CFG_SETUP:-${SWARM_SETUP}}"
 
-hlog "starting model=${CLAUDE_MODEL} prompt=${SWARM_PROMPT} context=${SWARM_CONTEXT}"
+# Map effort levels to opencode --variant values.
+# Known aliases are translated; unknown values pass through
+# as-is so provider-specific variants work directly.
+VARIANT_ARG=""
+case "${OPENCODE_EFFORT}" in
+    "")     ;;
+    low)    VARIANT_ARG="--variant minimal" ;;
+    medium) VARIANT_ARG="--variant high" ;;
+    high)   VARIANT_ARG="--variant max" ;;
+    *)      VARIANT_ARG="--variant ${OPENCODE_EFFORT}" ;;
+esac
+
+hlog "starting model=${OPENCODE_MODEL} prompt=${SWARM_PROMPT} context=${SWARM_CONTEXT}"
 
 if [ ! -d "/workspace/.git" ]; then
     hlog "cloning upstream"
@@ -95,21 +108,24 @@ if [ ! -d "/workspace/.git" ]; then
 
     git checkout -q agent-work
 
-    # Strip .claude context per the context mode setting.
+    # Strip context directories per the context mode setting.
     # See: "Evaluating AGENTS.md" (arXiv:2602.11988) for motivation.
-    if [ -d .claude ]; then
-        case "$SWARM_CONTEXT" in
-            none)
-                hlog "context=none: removing .claude/"
-                rm -rf .claude
-                ;;
-            slim)
-                hlog "context=slim: keeping only .claude/CLAUDE.md"
-                find .claude -mindepth 1 -maxdepth 1 ! -name CLAUDE.md \
-                    -exec rm -rf {} +
-                ;;
-        esac
-    fi
+    for ctx_dir in .claude .opencode; do
+        if [ -d "$ctx_dir" ]; then
+            case "$SWARM_CONTEXT" in
+                none)
+                    hlog "context=none: removing ${ctx_dir}/"
+                    rm -rf "$ctx_dir"
+                    ;;
+                slim)
+                    hlog "context=slim: keeping only ${ctx_dir}/CLAUDE.md"
+                    find "$ctx_dir" -mindepth 1 -maxdepth 1 \
+                        ! -name CLAUDE.md \
+                        -exec rm -rf {} +
+                    ;;
+            esac
+        fi
+    done
 
     # Run project-specific setup if provided.
     if [ -n "$SWARM_SETUP" ] && [ -f "$SWARM_SETUP" ]; then
@@ -120,10 +136,9 @@ if [ ! -d "/workspace/.git" ]; then
         sudo chown -R "$(id -u):$(id -g)" /workspace
     fi
 
-    # Disable Claude Code's Co-Authored-By trailer; the hook-injected
-    # trailers (Model/Agent) are the single source of truth.
-    mkdir -p .claude
-    printf '{"attribution":{"commit":"","pr":""}}\n' > .claude/settings.local.json
+    # Install swarm agent definition for opencode.
+    mkdir -p .opencode/agents
+    cp /swarm-agent.md .opencode/agents/swarm.md
 
     # Install prepare-commit-msg hook to append provenance trailers.
     # Fires on every commit including git commit -m.
@@ -133,8 +148,8 @@ if [ ! -d "/workspace/.git" ]; then
     cat > .git/hooks/prepare-commit-msg <<'HOOK'
 #!/bin/bash
 if ! grep -q '^Model:' "$1"; then
-    printf '\nModel: %s\nTools: claude-swarm %s, Claude Code %s\n' \
-        "$CLAUDE_MODEL" "$SWARM_VERSION" "$CLAUDE_VERSION" >> "$1"
+    printf '\nModel: %s\nTools: swarm %s, OpenCode %s\n' \
+        "$OPENCODE_MODEL" "$SWARM_VERSION" "$OPENCODE_VERSION" >> "$1"
     printf '> Run: %s\n' "$SWARM_RUN_CONTEXT" >> "$1"
     cfg="$SWARM_CFG_PROMPT"
     [ -n "$SWARM_CFG_SETUP" ] && cfg="${cfg}, ${SWARM_CFG_SETUP}"
@@ -156,8 +171,8 @@ msg=$(git log -1 --format='%B' HEAD 2>/dev/null) || exit 0
 if printf '%s' "$msg" | grep -q '^Model:'; then
     exit 0
 fi
-trailer=$(printf '\nModel: %s\nTools: claude-swarm %s, Claude Code %s\n' \
-    "$CLAUDE_MODEL" "$SWARM_VERSION" "$CLAUDE_VERSION")
+trailer=$(printf '\nModel: %s\nTools: swarm %s, OpenCode %s\n' \
+    "$OPENCODE_MODEL" "$SWARM_VERSION" "$OPENCODE_VERSION")
 trailer+=$(printf '> Run: %s\n' "$SWARM_RUN_CONTEXT")
 cfg="$SWARM_CFG_PROMPT"
 [ -n "$SWARM_CFG_SETUP" ] && cfg="${cfg}, ${SWARM_CFG_SETUP}"
@@ -216,37 +231,61 @@ while true; do
         continue
     fi
 
-    APPEND_ARGS=()
+    # Build prompt text: task prompt + optional git rules.
+    PROMPT_TEXT=$(cat "$SWARM_PROMPT")
     if [ "$INJECT_GIT_RULES" = "true" ] && [ -f /agent-system-prompt.md ]; then
-        APPEND_ARGS+=(--append-system-prompt-file /agent-system-prompt.md)
+        PROMPT_TEXT="${PROMPT_TEXT}
+
+$(cat /agent-system-prompt.md)"
     fi
 
-    claude --dangerously-skip-permissions \
-           -p "$(cat "$SWARM_PROMPT")" \
-           --model "$CLAUDE_MODEL" \
-           "${APPEND_ARGS[@]+"${APPEND_ARGS[@]}"}" \
-           --output-format stream-json --verbose 2>"${LOGFILE}.err" \
+    # shellcheck disable=SC2086
+    opencode run "$PROMPT_TEXT" \
+        --model "$OPENCODE_MODEL" \
+        --agent swarm \
+        ${VARIANT_ARG:+$VARIANT_ARG} \
+        --format json \
+        --dir /workspace 2>"${LOGFILE}.err" \
         | stdbuf -oL tee "$LOGFILE" \
         | /activity-filter.sh || true
 
-    # Extract usage stats from the result line in the JSONL stream.
-    RESULT_LINE=$(grep '"type"[[:space:]]*:[[:space:]]*"result"' "$LOGFILE" 2>/dev/null | tail -1 || true)
-    cost=$(echo "$RESULT_LINE" | jq -r '.total_cost_usd // 0' 2>/dev/null || true)
+    # Extract usage stats from step_finish events in the NDJSON stream.
+    # Sum across all step_finish events (multiple per session possible).
+    cost=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.cost // 0] | add // 0' "$LOGFILE" 2>/dev/null || echo 0)
     cost="${cost:-0}"
-    dur=$(echo "$RESULT_LINE" | jq -r '.duration_ms // 0' 2>/dev/null || true)
-    dur="${dur:-0}"
-    api_ms=$(echo "$RESULT_LINE" | jq -r '.duration_api_ms // 0' 2>/dev/null || true)
-    api_ms="${api_ms:-0}"
-    turns=$(echo "$RESULT_LINE" | jq -r '.num_turns // 0' 2>/dev/null || true)
-    turns="${turns:-0}"
-    tok_in=$(echo "$RESULT_LINE" | jq -r '.usage.input_tokens // 0' 2>/dev/null || true)
+    tok_in=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.input // 0] | add // 0' "$LOGFILE" 2>/dev/null || echo 0)
     tok_in="${tok_in:-0}"
-    tok_out=$(echo "$RESULT_LINE" | jq -r '.usage.output_tokens // 0' 2>/dev/null || true)
+    tok_out=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.output // 0] | add // 0' "$LOGFILE" 2>/dev/null || echo 0)
     tok_out="${tok_out:-0}"
-    cache_rd=$(echo "$RESULT_LINE" | jq -r '.usage.cache_read_input_tokens // 0' 2>/dev/null || true)
+    cache_rd=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.cache.read // 0] | add // 0' "$LOGFILE" 2>/dev/null || echo 0)
     cache_rd="${cache_rd:-0}"
-    cache_cr=$(echo "$RESULT_LINE" | jq -r '.usage.cache_creation_input_tokens // 0' 2>/dev/null || true)
+    cache_cr=$(jq -s '[.[] | select(.type=="step_finish")
+        | .part.tokens.cache.write // 0] | add // 0' "$LOGFILE" 2>/dev/null || echo 0)
     cache_cr="${cache_cr:-0}"
+
+    # Duration: first step_start to last step_finish timestamp.
+    ts_start=$(jq -s '[.[] | select(.type=="step_start")
+        | .timestamp // 0] | min // 0' "$LOGFILE" 2>/dev/null || echo 0)
+    ts_end=$(jq -s '[.[] | select(.type=="step_finish")
+        | .timestamp // 0] | max // 0' "$LOGFILE" 2>/dev/null || echo 0)
+    if [ "$ts_start" -gt 0 ] && [ "$ts_end" -gt 0 ]; then
+        dur=$(( (ts_end - ts_start) * 1000 ))
+    else
+        dur=0
+    fi
+
+    # API time not separately tracked; use same as wall duration.
+    api_ms="$dur"
+
+    # Turns: count step_finish events.
+    turns=$(jq -s '[.[] | select(.type=="step_finish")] | length' \
+        "$LOGFILE" 2>/dev/null || echo 0)
+    turns="${turns:-0}"
+
     mkdir -p "$(dirname "$STATS_FILE")"
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$(date +%s)" "$cost" "$tok_in" "$tok_out" \
